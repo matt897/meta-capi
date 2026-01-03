@@ -253,6 +253,24 @@ export async function listErrors(db, { type, limit = 20 }) {
   }));
 }
 
+export async function listRecentErrors(db, limit = 20) {
+  const rows = await db.all(
+    `
+      SELECT errors.*, sites.name AS site_name, sites.pixel_id AS pixel_id
+      FROM errors
+      LEFT JOIN sites ON errors.site_id = sites.site_id
+      ORDER BY errors.id DESC
+      LIMIT ?
+    `,
+    limit
+  );
+
+  return rows.map(row => ({
+    ...row,
+    meta_body: row.meta_body ? JSON.parse(row.meta_body) : null
+  }));
+}
+
 export async function listRecentEventsForError(db, errorType, limit = 5) {
   return db.all(
     `

@@ -8,7 +8,9 @@ A Dockerized, SQLite-backed Meta Conversions API gateway with a server-rendered 
 docker compose up --build
 ```
 
-Open `http://localhost:3000/login` and sign in with the admin password (default `admin123` from `docker-compose.yml`).
+Open `http://localhost:3000/` for the lightweight status page, or visit
+`http://localhost:3000/login` and sign in with the admin password (default `admin123` from
+`docker-compose.yml`).
 
 ## Add a site
 
@@ -53,6 +55,12 @@ curl -X POST http://localhost:3000/collect \
 - **Live Events**: auto-refreshing stream with event details and payload tabs.
 - **Errors**: grouped by type with suggested resolutions.
 - **Settings**: runtime config (Meta API version, retries, dedup TTL, log retention, HMAC, rate limits).
+
+## Homepage + admin APIs
+
+Previously the container returned `Cannot GET /` because no homepage route or static files were
+served at `/`. The gateway now ships a minimal developer homepage at `/` plus a header-authenticated
+admin page at `/admin` with supporting JSON endpoints (`/admin/sites`, `/admin/logs`, `/health`).
 
 ## Docker notes
 
