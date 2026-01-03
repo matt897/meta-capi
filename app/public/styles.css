@@ -189,6 +189,23 @@ td {
   color: #f97316;
 }
 
+.pill-test_event_sent,
+.pill-test_event_success {
+  background: rgba(74, 222, 128, 0.2);
+  color: #4ade80;
+}
+
+.pill-test_event_failed,
+.pill-test_event_error {
+  background: rgba(248, 113, 113, 0.2);
+  color: #f87171;
+}
+
+.pill-test_event_skipped {
+  background: rgba(248, 113, 113, 0.2);
+  color: #f97316;
+}
+
 .pill-error {
   background: rgba(248, 113, 113, 0.2);
   color: #f87171;
@@ -237,6 +254,19 @@ td {
 }
 
 .event-row.outbound_skipped {
+  border-left: 4px solid #f97316;
+}
+
+.event-row.test_event_sent {
+  border-left: 4px solid #4ade80;
+}
+
+.event-row.test_event_failed,
+.event-row.test_event_error {
+  border-left: 4px solid #f87171;
+}
+
+.event-row.test_event_skipped {
   border-left: 4px solid #f97316;
 }
 
@@ -299,6 +329,10 @@ td {
 }
 
 .tab-content.hidden {
+  display: none;
+}
+
+.hidden {
   display: none;
 }
 

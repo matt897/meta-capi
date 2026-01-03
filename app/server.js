@@ -88,6 +88,9 @@ app.use("/assets", express.static(path.join(process.cwd(), "public")));
 
 const rateLimitState = new Map();
 
+const TEST_EVENT_TYPES = ["PageView", "ViewContent", "Lead", "AddToCart", "Purchase"];
+const DEFAULT_TEST_EVENT_SOURCE_URL = "https://example.com/test";
+
 async function getSettingValue(key, fallback = null) {
   const value = await getSetting(db, key);
   return value ?? fallback;
@@ -223,6 +226,101 @@ function generateEventId({ siteId, eventName, eventTime, identifiers }) {
   return crypto.createHash("sha256").update(raw).digest("hex");
 }
 
+function normalizeContentIds(value) {
+  if (!value) return null;
+  if (Array.isArray(value)) {
+    const trimmed = value.map(item => String(item).trim()).filter(Boolean);
+    return trimmed.length ? trimmed : null;
+  }
+  if (typeof value === "string") {
+    const trimmed = value
+      .split(",")
+      .map(item => item.trim())
+      .filter(Boolean);
+    return trimmed.length ? trimmed : null;
+  }
+  return null;
+}
+
+function toNumber(value, fallback) {
+  if (value === undefined || value === null || value === "") return fallback;
+  const parsed = Number.parseFloat(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function buildTestEvent(eventType, overrides = {}, context = {}) {
+  const now = context.now ?? Math.floor(Date.now() / 1000);
+  const eventSourceUrl = overrides.event_source_url || context.event_source_url || DEFAULT_TEST_EVENT_SOURCE_URL;
+  const eventId = `${eventType}-${uuid()}`;
+
+  const userData = {
+    client_user_agent: overrides.client_user_agent || "Meta-CAPI-Gateway-Test/1.0"
+  };
+
+  if (overrides.user_data && typeof overrides.user_data === "object") {
+    Object.assign(userData, overrides.user_data);
+  }
+
+  ["em", "ph", "external_id", "fbp", "fbc"].forEach(key => {
+    if (overrides[key]) {
+      userData[key] = overrides[key];
+    }
+  });
+
+  const customData = {};
+
+  switch (eventType) {
+    case "ViewContent": {
+      customData.content_name = overrides.content_name || "Test Content";
+      customData.content_type = overrides.content_type || "product";
+      const contentIds = normalizeContentIds(overrides.content_ids);
+      if (contentIds) customData.content_ids = contentIds;
+      break;
+    }
+    case "Lead": {
+      customData.content_name = overrides.content_name || "Test Lead";
+      break;
+    }
+    case "AddToCart": {
+      customData.value = toNumber(overrides.value, 1.0);
+      customData.currency = overrides.currency || "USD";
+      customData.content_type = overrides.content_type || "product";
+      customData.content_ids = normalizeContentIds(overrides.content_ids) || ["test_sku"];
+      if (overrides.content_name) customData.content_name = overrides.content_name;
+      break;
+    }
+    case "Purchase": {
+      customData.value = toNumber(overrides.value, 1.0);
+      customData.currency = overrides.currency || "USD";
+      customData.content_type = overrides.content_type || "product";
+      customData.content_ids = normalizeContentIds(overrides.content_ids) || ["test_sku"];
+      if (overrides.content_name) customData.content_name = overrides.content_name;
+      break;
+    }
+    default:
+      break;
+  }
+
+  if (overrides.custom_data && typeof overrides.custom_data === "object") {
+    Object.assign(customData, overrides.custom_data);
+  }
+
+  const event = {
+    event_name: eventType,
+    event_time: now,
+    event_id: eventId,
+    action_source: overrides.action_source || "website",
+    event_source_url: eventSourceUrl,
+    user_data: userData
+  };
+
+  if (Object.keys(customData).length) {
+    event.custom_data = customData;
+  }
+
+  return event;
+}
+
 function verifySignature({ secret, rawBody, signature }) {
   const expected = crypto
     .createHmac("sha256", secret)
@@ -302,6 +400,204 @@ function getErrorSuggestion(type) {
   return suggestions[type] || "Review the error details and recent events for context.";
 }
 
+async function sendTestEvent({ site, eventType, overrides }) {
+  const event = buildTestEvent(eventType, overrides, {
+    now: Math.floor(Date.now() / 1000),
+    event_source_url: DEFAULT_TEST_EVENT_SOURCE_URL
+  });
+
+  const payload = {
+    data: [event]
+  };
+
+  if (site.test_event_code) {
+    payload.test_event_code = site.test_event_code;
+  }
+
+  const outboundLog = JSON.stringify({
+    ...payload,
+    data: [sanitizePayload(event, site.log_full_payloads === 1)]
+  });
+  const inboundLog = JSON.stringify(sanitizePayload(event, site.log_full_payloads === 1));
+
+  const baseResponse = {
+    ok: false,
+    site_id: site.site_id,
+    event_type: eventType,
+    outbound_payload: payload,
+    meta_status: 0,
+    meta_response: null,
+    note: ""
+  };
+
+  if (!site.pixel_id || !site.access_token) {
+    await insertEvent(db, {
+      site_id: site.site_id,
+      event_id: event.event_id,
+      event_name: event.event_name,
+      status: "test_event_skipped",
+      inbound_json: inboundLog,
+      outbound_json: outboundLog,
+      meta_status: 0,
+      meta_body: JSON.stringify({ reason: "missing_credentials" })
+    });
+    await cleanupRetention(db, await getSettingNumber("log_retention_hours", 168));
+    await log({
+      type: "test_event",
+      site_id: site.site_id,
+      message: "missing credentials",
+      event_type: eventType
+    });
+    return {
+      ...baseResponse,
+      ok: false,
+      forwarded: false,
+      reason: "missing_credentials",
+      meta_response: { reason: "missing_credentials" },
+      note: "Missing credentials"
+    };
+  }
+
+  if (!site.test_event_code) {
+    await insertEvent(db, {
+      site_id: site.site_id,
+      event_id: event.event_id,
+      event_name: event.event_name,
+      status: "test_event_skipped",
+      inbound_json: inboundLog,
+      outbound_json: outboundLog,
+      meta_status: 0,
+      meta_body: JSON.stringify({ reason: "missing_test_event_code" })
+    });
+    await cleanupRetention(db, await getSettingNumber("log_retention_hours", 168));
+    await log({
+      type: "test_event",
+      site_id: site.site_id,
+      message: "missing test event code",
+      event_type: eventType
+    });
+    return {
+      ...baseResponse,
+      ok: false,
+      forwarded: false,
+      reason: "missing_test_event_code",
+      meta_response: { reason: "missing_test_event_code" },
+      note: "Missing test event code"
+    };
+  }
+
+  if (!site.send_to_meta || site.dry_run) {
+    const reason = site.dry_run ? "dry_run" : "send_disabled";
+    await insertEvent(db, {
+      site_id: site.site_id,
+      event_id: event.event_id,
+      event_name: event.event_name,
+      status: "test_event_skipped",
+      inbound_json: inboundLog,
+      outbound_json: outboundLog,
+      meta_status: 0,
+      meta_body: JSON.stringify({ reason })
+    });
+    await cleanupRetention(db, await getSettingNumber("log_retention_hours", 168));
+    await log({
+      type: "test_event",
+      site_id: site.site_id,
+      message: "test event skipped",
+      event_type: eventType,
+      reason
+    });
+    return {
+      ...baseResponse,
+      ok: true,
+      forwarded: false,
+      reason,
+      meta_response: { reason },
+      note: reason === "dry_run" ? "Dry-run: not sent" : "Send to Meta disabled"
+    };
+  }
+
+  const apiVersion = await getSettingValue("default_meta_api_version", "v19.0");
+  const url = `https://graph.facebook.com/${apiVersion}/${site.pixel_id}/events?access_token=${site.access_token}`;
+
+  try {
+    const retryCount = await getSettingNumber("retry_count", 1);
+    const { response, body } = await sendToMeta({ url, payload, retryCount });
+    const status = response.status;
+
+    const eventDbId = await insertEvent(db, {
+      site_id: site.site_id,
+      event_id: event.event_id,
+      event_name: event.event_name,
+      status: response.ok ? "test_event_sent" : "test_event_failed",
+      inbound_json: inboundLog,
+      outbound_json: outboundLog,
+      meta_status: status,
+      meta_body: JSON.stringify(body)
+    });
+
+    if (!response.ok) {
+      const errorType = status >= 500 ? "meta_5xx" : "meta_4xx";
+      await insertError(db, {
+        type: errorType,
+        site_id: site.site_id,
+        event_db_id: eventDbId,
+        event_id: event.event_id,
+        message: "Meta API error",
+        meta_status: status,
+        meta_body: JSON.stringify(body)
+      });
+    }
+
+    await cleanupRetention(db, await getSettingNumber("log_retention_hours", 168));
+    await log({
+      type: "test_event",
+      site_id: site.site_id,
+      message: "test event sent",
+      event_type: eventType,
+      status
+    });
+
+    return {
+      ...baseResponse,
+      ok: response.ok,
+      forwarded: true,
+      meta_status: status,
+      meta_response: body,
+      note: "Sent with test_event_code"
+    };
+  } catch (err) {
+    await insertEvent(db, {
+      site_id: site.site_id,
+      event_id: event.event_id,
+      event_name: event.event_name,
+      status: "test_event_error",
+      inbound_json: inboundLog,
+      outbound_json: outboundLog,
+      meta_status: null,
+      meta_body: JSON.stringify({ error: err.toString() })
+    });
+
+    await insertError(db, {
+      type: "network",
+      site_id: site.site_id,
+      event_id: event.event_id,
+      message: err.toString()
+    });
+
+    await cleanupRetention(db, await getSettingNumber("log_retention_hours", 168));
+    await log({ type: "test_event", error: err.toString(), site_id: site.site_id });
+
+    return {
+      ...baseResponse,
+      ok: false,
+      forwarded: false,
+      reason: "network_error",
+      meta_response: { error: err.toString() },
+      note: "Network error"
+    };
+  }
+}
+
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 app.get("/", (req, res) => {
@@ -328,6 +624,28 @@ app.get("/admin/sites", requireAdminHeader, async (req, res) => {
       updated_at: site.updated_at
     }))
   );
+});
+
+app.post("/admin/sites/:siteId/test-event", requireAdminHeader, async (req, res) => {
+  const site = await getSiteById(db, req.params.siteId);
+  if (!site) {
+    return res.status(404).json({ ok: false, error: "site_not_found" });
+  }
+
+  const eventType = req.body.event_type;
+  if (!eventType || !TEST_EVENT_TYPES.includes(eventType)) {
+    return res.status(400).json({
+      ok: false,
+      reason: "invalid_event_type",
+      allowed_types: TEST_EVENT_TYPES
+    });
+  }
+
+  const overrides = req.body.overrides && typeof req.body.overrides === "object"
+    ? req.body.overrides
+    : {};
+  const result = await sendTestEvent({ site, eventType, overrides });
+  res.json(result);
 });
 
 app.post("/admin/sites", requireAdminHeader, async (req, res) => {
@@ -539,9 +857,7 @@ app.get("/dashboard/sites", requireLogin, async (req, res) => {
           <div class="actions">
             <a class="button" href="/dashboard/live?site=${site.site_id}">View Events</a>
             <a class="button secondary" href="/dashboard/sites/${site.site_id}">Edit Settings</a>
-            <form method="post" action="/dashboard/sites/${site.site_id}/test-event">
-              <button type="submit" class="secondary">Send Test Event</button>
-            </form>
+            <a class="button secondary" href="/dashboard/sites/${site.site_id}#test-event">Send Test Event</a>
           </div>
         </div>
       `;
@@ -609,6 +925,9 @@ app.get("/dashboard/sites/:siteId", requireLogin, async (req, res) => {
 
   const status = renderSiteStatus(site);
   const maskedToken = site.access_token ? maskToken(site.access_token) : "—";
+  const testEventOptions = TEST_EVENT_TYPES.map(
+    type => `<option value="${type}">${type}</option>`
+  ).join("");
 
   const body = `
     <div class="card">
@@ -662,6 +981,53 @@ app.get("/dashboard/sites/:siteId", requireLogin, async (req, res) => {
         <button type="submit">Save settings</button>
       </form>
     </div>
+    <div class="card" id="test-event">
+      <h2>Send Test Event</h2>
+      <p class="muted">Generate a Meta test event using this site's credentials. Test events always include the site's test event code.</p>
+      <div id="test-event-warning" class="banner warning hidden"></div>
+      <form id="test-event-form" class="form-grid"
+        data-site-id="${site.site_id}"
+        data-has-credentials="${Boolean(site.pixel_id && site.access_token)}"
+        data-has-test-event-code="${Boolean(site.test_event_code)}"
+        data-send-to-meta="${Boolean(site.send_to_meta)}"
+        data-dry-run="${Boolean(site.dry_run)}">
+        <label>Event Type
+          <select name="event_type" id="test-event-type">
+            ${testEventOptions}
+          </select>
+        </label>
+        <label data-event-types="PageView,ViewContent,Lead,AddToCart,Purchase">Event Source URL
+          <input name="event_source_url" placeholder="${DEFAULT_TEST_EVENT_SOURCE_URL}" />
+        </label>
+        <label data-event-types="ViewContent,Lead,AddToCart,Purchase">Content Name
+          <input name="content_name" placeholder="Test Content" />
+        </label>
+        <label data-event-types="ViewContent,AddToCart,Purchase">Content IDs (comma separated)
+          <input name="content_ids" placeholder="test_sku" />
+        </label>
+        <label data-event-types="AddToCart,Purchase">Value
+          <input name="value" type="number" step="0.01" placeholder="1.00" />
+        </label>
+        <label data-event-types="AddToCart,Purchase">Currency
+          <input name="currency" placeholder="USD" />
+        </label>
+        <button type="submit" id="test-event-submit">Send Test Event</button>
+      </form>
+      <div id="test-event-result" class="test-event-result hidden">
+        <div class="inline">
+          <span id="test-event-status" class="pill">Pending</span>
+          <span id="test-event-note" class="muted"></span>
+        </div>
+        <details open>
+          <summary>Outbound payload</summary>
+          <pre id="test-event-payload">—</pre>
+        </details>
+        <details>
+          <summary>Meta response</summary>
+          <pre id="test-event-response">—</pre>
+        </details>
+      </div>
+    </div>
     <script>
       const revealButton = document.getElementById('reveal-token');
       const tokenInput = document.querySelector('input[name="access_token"]');
@@ -676,6 +1042,139 @@ app.get("/dashboard/sites/:siteId", requireLogin, async (req, res) => {
           tokenInput.value = data.access_token;
         } else {
           alert('No access token stored yet.');
+        }
+      });
+    </script>
+    <script>
+      const testForm = document.getElementById('test-event-form');
+      const testType = document.getElementById('test-event-type');
+      const testWarning = document.getElementById('test-event-warning');
+      const testResult = document.getElementById('test-event-result');
+      const testStatus = document.getElementById('test-event-status');
+      const testNote = document.getElementById('test-event-note');
+      const testPayload = document.getElementById('test-event-payload');
+      const testResponse = document.getElementById('test-event-response');
+      const testSubmit = document.getElementById('test-event-submit');
+      const testFields = testForm.querySelectorAll('[data-event-types]');
+
+      function updateTestFieldVisibility() {
+        const selected = testType.value;
+        testFields.forEach(field => {
+          const types = field.dataset.eventTypes.split(',').map(item => item.trim());
+          field.classList.toggle('hidden', !types.includes(selected));
+        });
+      }
+
+      function setWarning(message) {
+        if (message) {
+          testWarning.textContent = message;
+          testWarning.classList.remove('hidden');
+        } else {
+          testWarning.textContent = '';
+          testWarning.classList.add('hidden');
+        }
+      }
+
+      function applyStatus(label, className) {
+        testStatus.textContent = label;
+        testStatus.className = 'pill ' + className;
+      }
+
+      function inferStatus(result) {
+        if (result.forwarded === false) {
+          return { label: 'Skipped', className: 'pill-outbound_skipped' };
+        }
+        if (result.meta_status >= 200 && result.meta_status < 300) {
+          if (result.meta_response && result.meta_response.events_received > 0) {
+            return { label: 'Processed', className: 'pill-success' };
+          }
+          return { label: 'Sent', className: 'pill-ready' };
+        }
+        return { label: 'Rejected', className: 'pill-error' };
+      }
+
+      function renderResult(result) {
+        testResult.classList.remove('hidden');
+        testPayload.textContent = JSON.stringify(result.outbound_payload || {}, null, 2);
+        testResponse.textContent = JSON.stringify({
+          status: result.meta_status,
+          body: result.meta_response
+        }, null, 2);
+        testNote.textContent = result.note || '';
+        const status = inferStatus(result);
+        applyStatus(status.label, status.className);
+      }
+
+      function renderHint() {
+        const hasCredentials = testForm.dataset.hasCredentials === 'true';
+        const hasTestEventCode = testForm.dataset.hasTestEventCode === 'true';
+        if (!hasCredentials) {
+          setWarning('Missing credentials. Add a Pixel ID and Access Token above to send test events.');
+          return;
+        }
+        if (!hasTestEventCode) {
+          setWarning('Missing test event code. Find it in Events Manager → Test Events.');
+          return;
+        }
+        setWarning('');
+      }
+
+      testType.addEventListener('change', updateTestFieldVisibility);
+      updateTestFieldVisibility();
+      renderHint();
+
+      testForm.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        setWarning('');
+        testSubmit.disabled = true;
+        testSubmit.textContent = 'Sending…';
+
+        const formData = new FormData(testForm);
+        const overrides = {};
+        const eventSourceUrl = formData.get('event_source_url');
+        if (eventSourceUrl) overrides.event_source_url = eventSourceUrl;
+        const contentName = formData.get('content_name');
+        if (contentName) overrides.content_name = contentName;
+        const contentIds = formData.get('content_ids');
+        if (contentIds) {
+          overrides.content_ids = contentIds.split(',').map(item => item.trim()).filter(Boolean);
+        }
+        const value = formData.get('value');
+        if (value) overrides.value = value;
+        const currency = formData.get('currency');
+        if (currency) overrides.currency = currency;
+
+        try {
+          const response = await fetch('/dashboard/sites/${site.site_id}/test-event', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              event_type: formData.get('event_type'),
+              overrides
+            })
+          });
+          const result = await response.json();
+          if (!response.ok) {
+            setWarning(result.error || 'Failed to send test event.');
+            return;
+          }
+
+          renderResult(result);
+
+          if (result.reason === 'missing_credentials') {
+            setWarning('Missing credentials. Add a Pixel ID and Access Token above to send test events.');
+          } else if (result.reason === 'missing_test_event_code') {
+            setWarning('Missing test event code. Find it in Events Manager → Test Events.');
+          } else if (result.reason === 'dry_run') {
+            setWarning('Dry-run is enabled. Disable dry-run to send test events.');
+          } else if (result.reason === 'send_disabled') {
+            setWarning('Send to Meta is disabled for this site.');
+          }
+        } catch {
+          setWarning('Request failed. Check connectivity and try again.');
+        } finally {
+          testSubmit.disabled = false;
+          testSubmit.textContent = 'Send Test Event';
         }
       });
     </script>
@@ -743,86 +1242,23 @@ app.get("/dashboard/sites/:siteId/token", requireLogin, async (req, res) => {
 app.post("/dashboard/sites/:siteId/test-event", requireLogin, async (req, res) => {
   const site = await getSiteById(db, req.params.siteId);
   if (!site) {
-    return res.redirect("/dashboard/sites?notice=Site%20not%20found.");
+    return res.status(404).json({ ok: false, error: "site_not_found" });
   }
 
-  if (!site.pixel_id || !site.access_token) {
-    return res.redirect("/dashboard/sites?notice=Missing%20Meta%20credentials%20for%20test%20event.");
-  }
-
-  if (!site.test_event_code) {
-    return res.redirect("/dashboard/sites?notice=Add%20a%20test%20event%20code%20to%20send%20a%20test%20event.");
-  }
-
-  if (!site.send_to_meta || site.dry_run) {
-    return res.redirect("/dashboard/sites?notice=Enable%20send%20to%20Meta%20and%20disable%20dry%20run%20to%20send%20a%20test%20event.");
-  }
-
-  const testEvent = {
-    event_name: "PageView",
-    event_time: Math.floor(Date.now() / 1000),
-    event_id: uuid(),
-    action_source: "website",
-    user_data: {
-      external_id: crypto.randomBytes(8).toString("hex")
-    }
-  };
-
-  const payload = {
-    data: [testEvent],
-    test_event_code: site.test_event_code
-  };
-
-  const apiVersion = await getSettingValue("default_meta_api_version", "v19.0");
-  const url = `https://graph.facebook.com/${apiVersion}/${site.pixel_id}/events?access_token=${site.access_token}`;
-
-  const outboundLog = JSON.stringify({
-    ...payload,
-    data: [sanitizePayload(testEvent, site.log_full_payloads === 1)]
-  });
-  const inboundLog = JSON.stringify(sanitizePayload(testEvent, site.log_full_payloads === 1));
-
-  try {
-    const retryCount = await getSettingNumber("retry_count", 1);
-    const { response, body } = await sendToMeta({ url, payload, retryCount });
-    const eventDbId = await insertEvent(db, {
-      site_id: site.site_id,
-      event_id: testEvent.event_id,
-      event_name: testEvent.event_name,
-      status: "outbound_sent",
-      inbound_json: inboundLog,
-      outbound_json: outboundLog,
-      meta_status: response.status,
-      meta_body: JSON.stringify(body)
+  const eventType = req.body.event_type;
+  if (!eventType || !TEST_EVENT_TYPES.includes(eventType)) {
+    return res.status(400).json({
+      ok: false,
+      reason: "invalid_event_type",
+      allowed_types: TEST_EVENT_TYPES
     });
-
-    if (!response.ok) {
-      const errorType = response.status >= 500 ? "meta_5xx" : "meta_4xx";
-      await insertError(db, {
-        type: errorType,
-        site_id: site.site_id,
-        event_db_id: eventDbId,
-        event_id: testEvent.event_id,
-        message: "Meta API error",
-        meta_status: response.status,
-        meta_body: JSON.stringify(body)
-      });
-    }
-
-    await cleanupRetention(db, await getSettingNumber("log_retention_hours", 168));
-    await log({ type: "event", site_id: site.site_id, message: "test event sent" });
-
-    return res.redirect("/dashboard/sites?notice=Test%20event%20sent.");
-  } catch (err) {
-    await insertError(db, {
-      type: "network",
-      site_id: site.site_id,
-      event_id: testEvent.event_id,
-      message: err.toString()
-    });
-    await log({ type: "error", error: err.toString(), site_id: site.site_id });
-    return res.redirect("/dashboard/sites?notice=Failed%20to%20send%20test%20event.");
   }
+
+  const overrides = req.body.overrides && typeof req.body.overrides === "object"
+    ? req.body.overrides
+    : {};
+  const result = await sendTestEvent({ site, eventType, overrides });
+  res.json(result);
 });
 
 app.post("/dashboard/sites/:siteId/rotate", requireLogin, async (req, res) => {
