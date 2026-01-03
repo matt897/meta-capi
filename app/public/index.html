@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Meta CAPI Gateway</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <main>
+      <header class="card">
+        <h1>Meta CAPI Gateway</h1>
+        <p class="helper">This is a developer dashboard for validating Conversions API traffic.</p>
+        <div class="inline">
+          <span class="badge">● Gateway is running</span>
+          <span class="status" id="health-status">Health: checking…</span>
+          <span class="helper">Version v2 · Build 2024-06-15T00:00:00Z</span>
+        </div>
+      </header>
+
+      <section class="card grid">
+        <div>
+          <strong>Quick links</strong>
+          <ul>
+            <li><a href="/admin">/admin</a> (dashboard)</li>
+            <li><a href="/admin/sites">/admin/sites</a> (JSON)</li>
+            <li><a href="/admin/logs">/admin/logs</a> (JSON)</li>
+            <li><a href="/health">/health</a></li>
+          </ul>
+          <p class="helper">Admin endpoints require <code>X-Admin-Password</code>.</p>
+        </div>
+        <div>
+          <strong>Admin auth example</strong>
+          <pre>curl -H "X-Admin-Password: &lt;admin_password&gt;" http://localhost:3000/admin/sites</pre>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Send a test event</h2>
+        <p class="helper">Site ingestion uses the <code>x-site-key</code> header.</p>
+        <pre>curl -X POST http://localhost:3000/collect \
+  -H "content-type: application/json" \
+  -H "x-site-key: &lt;site_key&gt;" \
+  -d '{"event_name":"Purchase","event_time":1717000000}'</pre>
+      </section>
+
+      <section class="card">
+        <h2>Admin JSON APIs</h2>
+        <pre>curl -H "X-Admin-Password: &lt;admin_password&gt;" http://localhost:3000/admin/logs
+curl -X POST http://localhost:3000/admin/sites \
+  -H "content-type: application/json" \
+  -H "X-Admin-Password: &lt;admin_password&gt;" \
+  -d '{"name":"My Store","pixel_id":"123","access_token":"token"}'</pre>
+      </section>
+
+      <p class="footer">For the full interactive dashboard, visit <a href="/login">/login</a>.</p>
+    </main>
+
+    <script>
+      async function checkHealth() {
+        const statusEl = document.getElementById("health-status");
+        try {
+          const response = await fetch("/health");
+          const data = await response.json();
+          if (data.ok) {
+            statusEl.textContent = "Health: OK";
+            statusEl.classList.add("ok");
+          } else {
+            statusEl.textContent = "Health: unexpected response";
+            statusEl.classList.add("error");
+          }
+        } catch {
+          statusEl.textContent = "Health: unreachable";
+          statusEl.classList.add("error");
+        }
+      }
+      checkHealth();
+    </script>
+  </body>
+</html>

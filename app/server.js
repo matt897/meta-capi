@@ -25,6 +25,7 @@ import {
   listErrorGroups,
   listErrors,
   listEvents,
+  listRecentErrors,
   listRecentEventsForError,
   listSettings,
   rotateSiteKey,
@@ -45,6 +46,7 @@ app.use(
   })
 );
 app.use(express.urlencoded({ extended: true }));
+app.use(express.static("public"));
 
 const PORT = process.env.PORT || 3000;
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "admin";
@@ -147,6 +149,15 @@ function renderPage({ title, body, nav = true }) {
 function requireLogin(req, res, next) {
   if (!req.session?.isAdmin) {
     return res.redirect("/login");
+  }
+  next();
+}
+
+async function requireAdminHeader(req, res, next) {
+  const provided = req.get("x-admin-password");
+  const adminPassword = await getSettingValue("admin_password", ADMIN_PASSWORD);
+  if (!provided || provided !== adminPassword) {
+    return res.status(401).send("Unauthorized");
   }
   next();
 }
@@ -263,6 +274,66 @@ function getErrorSuggestion(type) {
 }
 
 app.get("/health", (req, res) => res.json({ ok: true }));
+
+app.get("/", (req, res) => {
+  res.sendFile(path.join(process.cwd(), "public", "index.html"));
+});
+
+app.get("/admin", (req, res) => {
+  res.sendFile(path.join(process.cwd(), "public", "admin.html"));
+});
+
+app.get("/admin/sites", requireAdminHeader, async (req, res) => {
+  const sites = await getSites(db);
+  res.json(
+    sites.map(site => ({
+      site_id: site.site_id,
+      name: site.name,
+      pixel_id: site.pixel_id,
+      site_key: site.site_key,
+      created_at: site.created_at
+    }))
+  );
+});
+
+app.post("/admin/sites", requireAdminHeader, async (req, res) => {
+  const { name, pixel_id, access_token, test_event_code, dry_run, log_full_payloads } = req.body;
+
+  if (!name || !pixel_id || !access_token) {
+    return res.status(400).json({ error: "name, pixel_id, and access_token are required" });
+  }
+
+  const site_id = uuid();
+  const site_key = uuid();
+
+  await createSite(db, {
+    site_id,
+    site_key,
+    name,
+    pixel_id,
+    access_token,
+    test_event_code,
+    dry_run: Boolean(dry_run),
+    log_full_payloads: log_full_payloads !== false
+  });
+
+  await log({ type: "admin", message: "site created", site_id });
+
+  res.status(201).json({
+    site_id,
+    site_key,
+    name,
+    pixel_id
+  });
+});
+
+app.get("/admin/logs", requireAdminHeader, async (req, res) => {
+  const limit = Number.parseInt(req.query.limit ?? "20", 10);
+  const safeLimit = Number.isNaN(limit) ? 20 : limit;
+  const events = await listEvents(db, { limit: safeLimit });
+  const errors = await listRecentErrors(db, safeLimit);
+  res.json({ events, errors });
+});
 
 app.get("/login", (req, res) => {
   const body = `
