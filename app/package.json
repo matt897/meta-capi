@@ -1,9 +1,13 @@
 {
   "name": "meta-capi-gateway",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "dependencies": {
+    "connect-sqlite3": "^0.9.13",
     "express": "^4.19.2",
+    "express-session": "^1.18.0",
+    "sqlite": "^5.1.1",
+    "sqlite3": "^5.1.7",
     "uuid": "^9.0.1"
   }
 }

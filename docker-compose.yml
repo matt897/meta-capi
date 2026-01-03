@@ -1,13 +1,13 @@
 services:
   capi:
-    image: node:20-alpine
-    working_dir: /app
-    volumes:
-      - ./app:/app
-    command: sh -c "npm install && node server.js"
+    build: .
+    ports:
+      - "3000:3000"
     environment:
       PORT: 3000
       ADMIN_PASSWORD: admin123
-    ports:
-      - "3000:3000"
+      SESSION_SECRET: change-me
+      DB_PATH: /data/meta-capi.sqlite
+    volumes:
+      - ./data:/data
     restart: unless-stopped
