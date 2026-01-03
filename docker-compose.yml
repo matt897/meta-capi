@@ -9,5 +9,8 @@ services:
       SESSION_SECRET: change-me
       DB_PATH: /data/meta-capi.sqlite
     volumes:
-      - ./data:/data
+      - meta-capi-data:/data
     restart: unless-stopped
+
+volumes:
+  meta-capi-data:

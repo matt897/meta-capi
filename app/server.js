@@ -6,20 +6,32 @@ import { v4 as uuid } from "uuid";
 import path from "path";
 import fs from "fs";
 import {
-  addLog,
+  cleanupRetention,
+  countDedupedSince,
+  countErrorsSince,
+  countErrorsTodayBySite,
+  countEventsSince,
+  countEventsTodayBySite,
   createSite,
   deleteSite,
   ensureSetting,
-  getLogs,
-  getSetting,
+  getEventById,
   getSiteById,
   getSiteByKey,
   getSites,
   initDb,
+  insertError,
+  insertEvent,
+  listErrorGroups,
+  listErrors,
+  listEvents,
+  listRecentEventsForError,
   listSettings,
+  rotateSiteKey,
   setSetting,
   storeEventId,
   updateSite,
+  getSetting,
   hasRecentEventId
 } from "./db.js";
 
@@ -47,10 +59,13 @@ if (!fs.existsSync(dbDir)) {
 const db = await initDb(DB_PATH);
 
 await ensureSetting(db, "admin_password", ADMIN_PASSWORD);
+await ensureSetting(db, "default_meta_api_version", "v19.0");
+await ensureSetting(db, "retry_count", "1");
+await ensureSetting(db, "dedup_ttl_hours", "48");
+await ensureSetting(db, "log_retention_hours", "168");
 await ensureSetting(db, "hmac_required", process.env.HMAC_REQUIRED || "false");
 await ensureSetting(db, "hmac_secret", process.env.HMAC_SECRET || "");
 await ensureSetting(db, "rate_limit_per_min", process.env.RATE_LIMIT_PER_MIN || "60");
-await ensureSetting(db, "log_limit", process.env.LOG_LIMIT || "200");
 
 const SQLiteStore = SQLiteStoreFactory(session);
 
@@ -66,6 +81,8 @@ app.use(
     }
   })
 );
+
+app.use("/assets", express.static(path.join(process.cwd(), "public")));
 
 const rateLimitState = new Map();
 
@@ -87,12 +104,10 @@ async function getSettingBoolean(key, fallback = false) {
 }
 
 async function log(entry) {
-  const logLimit = await getSettingNumber("log_limit", 200);
   const data = {
     time: new Date().toISOString(),
     ...entry
   };
-  await addLog(db, data, logLimit);
   console.log(JSON.stringify(data));
 }
 
@@ -100,8 +115,10 @@ function renderPage({ title, body, nav = true }) {
   const navHtml = nav
     ? `
     <nav class="nav">
+      <a href="/dashboard">Dashboard</a>
       <a href="/dashboard/sites">Sites</a>
-      <a href="/dashboard/logs">Event Console</a>
+      <a href="/dashboard/live">Live Events</a>
+      <a href="/dashboard/errors">Errors</a>
       <a href="/dashboard/settings">Settings</a>
       <a href="/logout">Logout</a>
     </nav>
@@ -115,25 +132,7 @@ function renderPage({ title, body, nav = true }) {
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <title>${title}</title>
-        <style>
-          :root { color-scheme: light dark; }
-          body { font-family: system-ui, sans-serif; margin: 0; padding: 0; background: #0f172a; color: #e2e8f0; }
-          .container { max-width: 980px; margin: 0 auto; padding: 32px; }
-          .nav { display: flex; gap: 16px; margin-bottom: 24px; }
-          .nav a { color: #e2e8f0; text-decoration: none; font-weight: 600; }
-          .card { background: #111827; border-radius: 12px; padding: 20px; margin-bottom: 20px; box-shadow: 0 10px 20px rgba(0,0,0,0.2); }
-          label { display: block; font-weight: 600; margin-top: 12px; }
-          input, textarea { width: 100%; padding: 10px; border-radius: 8px; border: 1px solid #334155; background: #0f172a; color: inherit; margin-top: 6px; }
-          button { background: #38bdf8; border: none; padding: 10px 16px; border-radius: 8px; font-weight: 700; cursor: pointer; margin-top: 12px; }
-          table { width: 100%; border-collapse: collapse; }
-          th, td { text-align: left; padding: 10px; border-bottom: 1px solid #1f2937; }
-          .muted { color: #94a3b8; font-size: 0.9rem; }
-          .row { display: flex; gap: 16px; flex-wrap: wrap; }
-          .row > div { flex: 1 1 280px; }
-          code { background: #1f2937; padding: 2px 6px; border-radius: 4px; }
-          .danger { background: #f97316; }
-          .success { color: #4ade80; }
-        </style>
+        <link rel="stylesheet" href="/assets/styles.css" />
       </head>
       <body>
         <div class="container">
@@ -152,232 +151,29 @@ function requireLogin(req, res, next) {
   next();
 }
 
-app.get("/health", (req, res) => res.json({ ok: true }));
+function formatDate(value) {
+  if (!value) return "—";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+}
 
-app.get("/login", (req, res) => {
-  const body = `
-    <div class="card">
-      <h1>Meta CAPI Gateway</h1>
-      <p class="muted">Admin login</p>
-      <form method="post" action="/login">
-        <label>Password</label>
-        <input type="password" name="password" required />
-        <button type="submit">Login</button>
-      </form>
-    </div>
-  `;
-  res.send(renderPage({ title: "Login", body, nav: false }));
-});
+function renderStatusPill(status) {
+  const normalized = status || "unknown";
+  return `<span class="pill pill-${normalized}">${normalized}</span>`;
+}
 
-app.post("/login", async (req, res) => {
-  const password = req.body.password ?? "";
-  const adminPassword = await getSettingValue("admin_password", ADMIN_PASSWORD);
-
-  if (password !== adminPassword) {
-    await log({ type: "auth", message: "invalid admin login" });
-    return res.status(401).send(renderPage({
-      title: "Login",
-      nav: false,
-      body: `<div class="card"><h1>Login failed</h1><p>Invalid password.</p><a href="/login">Try again</a></div>`
-    }));
-  }
-
-  req.session.isAdmin = true;
-  await log({ type: "auth", message: "admin login" });
-  res.redirect("/dashboard/sites");
-});
-
-app.get("/logout", (req, res) => {
-  req.session.destroy(() => {
-    res.redirect("/login");
-  });
-});
-
-app.get("/dashboard", requireLogin, (req, res) => {
-  res.redirect("/dashboard/sites");
-});
-
-app.get("/dashboard/sites", requireLogin, async (req, res) => {
-  const sites = await getSites(db);
-  const body = `
-    <div class="card">
-      <h1>Sites</h1>
-      <p class="muted">Manage site keys and Meta pixel credentials.</p>
-    </div>
-    <div class="card">
-      <h2>Create site</h2>
-      <form method="post" action="/dashboard/sites">
-        <div class="row">
-          <div>
-            <label>Name</label>
-            <input name="name" required />
-          </div>
-          <div>
-            <label>Pixel ID</label>
-            <input name="pixel_id" required />
-          </div>
-          <div>
-            <label>Access Token</label>
-            <input name="access_token" required />
-          </div>
-        </div>
-        <label>Test Event Code</label>
-        <input name="test_event_code" />
-        <button type="submit">Create site</button>
-      </form>
-    </div>
-    <div class="card">
-      <h2>Existing sites</h2>
-      <table>
-        <thead>
-          <tr>
-            <th>Name</th>
-            <th>Site ID</th>
-            <th>Site Key</th>
-            <th>Pixel ID</th>
-            <th>Actions</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${sites
-            .map(
-              site => `
-            <tr>
-              <td>${site.name ?? ""}</td>
-              <td><code>${site.site_id}</code></td>
-              <td><code>${site.site_key}</code></td>
-              <td>${site.pixel_id ?? ""}</td>
-              <td>
-                <form method="post" action="/dashboard/sites/${site.site_id}" style="margin-bottom:8px;">
-                  <label>Name</label>
-                  <input name="name" value="${site.name ?? ""}" />
-                  <label>Pixel ID</label>
-                  <input name="pixel_id" value="${site.pixel_id ?? ""}" />
-                  <label>Access Token</label>
-                  <input name="access_token" value="${site.access_token ?? ""}" />
-                  <label>Test Event Code</label>
-                  <input name="test_event_code" value="${site.test_event_code ?? ""}" />
-                  <button type="submit">Save</button>
-                </form>
-                <form method="post" action="/dashboard/sites/${site.site_id}/delete">
-                  <button type="submit" class="danger">Delete</button>
-                </form>
-              </td>
-            </tr>
-          `
-            )
-            .join("")}
-        </tbody>
-      </table>
-    </div>
-  `;
-
-  res.send(renderPage({ title: "Sites", body }));
-});
-
-app.post("/dashboard/sites", requireLogin, async (req, res) => {
-  const site_id = uuid();
-  const site_key = uuid();
-  await createSite(db, {
-    site_id,
-    site_key,
-    name: req.body.name,
-    pixel_id: req.body.pixel_id,
-    access_token: req.body.access_token,
-    test_event_code: req.body.test_event_code
-  });
-  await log({ type: "admin", message: "site created", site_id });
-  res.redirect("/dashboard/sites");
-});
-
-app.post("/dashboard/sites/:siteId", requireLogin, async (req, res) => {
-  const site_id = req.params.siteId;
-  await updateSite(db, {
-    site_id,
-    name: req.body.name,
-    pixel_id: req.body.pixel_id,
-    access_token: req.body.access_token,
-    test_event_code: req.body.test_event_code
-  });
-  await log({ type: "admin", message: "site updated", site_id });
-  res.redirect("/dashboard/sites");
-});
-
-app.post("/dashboard/sites/:siteId/delete", requireLogin, async (req, res) => {
-  const site_id = req.params.siteId;
-  await deleteSite(db, site_id);
-  await log({ type: "admin", message: "site deleted", site_id });
-  res.redirect("/dashboard/sites");
-});
-
-app.get("/dashboard/logs", requireLogin, async (req, res) => {
-  const body = `
-    <div class="card">
-      <h1>Event Console</h1>
-      <p class="muted">Polling every 2 seconds.</p>
-    </div>
-    <div class="card">
-      <pre id="log-output" style="white-space: pre-wrap;"></pre>
-    </div>
-    <script>
-      async function fetchLogs() {
-        const response = await fetch('/admin/logs?limit=100');
-        const data = await response.json();
-        document.getElementById('log-output').textContent = data
-          .map(entry => JSON.stringify(entry))
-          .join('\n');
-      }
-      fetchLogs();
-      setInterval(fetchLogs, 2000);
-    </script>
-  `;
-  res.send(renderPage({ title: "Event Console", body }));
-});
-
-app.get("/dashboard/settings", requireLogin, async (req, res) => {
-  const settings = Object.fromEntries((await listSettings(db)).map(s => [s.key, s.value]));
-  const body = `
-    <div class="card">
-      <h1>Settings</h1>
-      <p class="muted">Global configuration stored in SQLite.</p>
-      <form method="post" action="/dashboard/settings">
-        <label>Admin password</label>
-        <input name="admin_password" type="password" value="${settings.admin_password ?? ""}" />
-        <label>HMAC required (true/false)</label>
-        <input name="hmac_required" value="${settings.hmac_required ?? "false"}" />
-        <label>HMAC secret</label>
-        <input name="hmac_secret" value="${settings.hmac_secret ?? ""}" />
-        <label>Rate limit per minute</label>
-        <input name="rate_limit_per_min" value="${settings.rate_limit_per_min ?? "60"}" />
-        <label>Log limit</label>
-        <input name="log_limit" value="${settings.log_limit ?? "200"}" />
-        <button type="submit">Save settings</button>
-      </form>
-    </div>
-  `;
-  res.send(renderPage({ title: "Settings", body }));
-});
-
-app.post("/dashboard/settings", requireLogin, async (req, res) => {
-  await setSetting(db, "admin_password", req.body.admin_password || ADMIN_PASSWORD);
-  await setSetting(db, "hmac_required", req.body.hmac_required || "false");
-  await setSetting(db, "hmac_secret", req.body.hmac_secret || "");
-  await setSetting(db, "rate_limit_per_min", req.body.rate_limit_per_min || "60");
-  await setSetting(db, "log_limit", req.body.log_limit || "200");
-  await log({ type: "admin", message: "settings updated" });
-  res.redirect("/dashboard/settings");
-});
-
-app.get("/admin/sites", requireLogin, async (req, res) => {
-  const sites = await getSites(db);
-  res.json(sites);
-});
-
-app.get("/admin/logs", requireLogin, async (req, res) => {
-  const limit = Number.parseInt(req.query.limit ?? "100", 10);
-  const logs = await getLogs(db, Number.isNaN(limit) ? 100 : limit);
-  res.json(logs);
-});
+function sanitizePayload(payload, logFullPayloads) {
+  if (logFullPayloads) return payload;
+  if (!payload) return null;
+  return {
+    note: "Payload logging disabled for this site.",
+    event_name: payload.event_name,
+    event_time: payload.event_time,
+    event_id: payload.event_id,
+    user_data_keys: Object.keys(payload.user_data || {}),
+    custom_data_keys: Object.keys(payload.custom_data || {})
+  };
+}
 
 function generateEventId({ siteId, eventName, eventTime, identifiers }) {
   if (!eventName || !eventTime || identifiers.length === 0) {
@@ -415,17 +211,659 @@ function checkRateLimit(siteId, limitPerMinute) {
   return current.count <= limitPerMinute;
 }
 
+async function sendToMeta({ url, payload, retryCount }) {
+  let attempt = 0;
+  let lastError = null;
+
+  while (attempt <= retryCount) {
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const text = await response.text();
+      let body = null;
+
+      try {
+        body = text ? JSON.parse(text) : null;
+      } catch {
+        body = { raw: text };
+      }
+
+      if (response.status >= 500 && attempt < retryCount) {
+        attempt += 1;
+        continue;
+      }
+
+      return { response, body };
+    } catch (err) {
+      lastError = err;
+      if (attempt < retryCount) {
+        attempt += 1;
+        continue;
+      }
+      throw err;
+    }
+  }
+
+  if (lastError) throw lastError;
+  throw new Error("Unknown Meta API error");
+}
+
+function getErrorSuggestion(type) {
+  const suggestions = {
+    auth: "Check the site key or admin credentials and confirm access tokens are valid.",
+    validation: "Ensure event_name, event_time, and user_data fields match Meta requirements.",
+    meta_4xx: "Meta rejected the payload. Verify pixel ID, access token, and required fields.",
+    meta_5xx: "Meta is responding with server errors. Retry later or reduce request volume.",
+    network: "Gateway could not reach Meta. Check outbound connectivity and retry settings."
+  };
+  return suggestions[type] || "Review the error details and recent events for context.";
+}
+
+app.get("/health", (req, res) => res.json({ ok: true }));
+
+app.get("/login", (req, res) => {
+  const body = `
+    <div class="card">
+      <h1>Meta CAPI Gateway</h1>
+      <p class="muted">Admin login</p>
+      <form method="post" action="/login">
+        <label>Password</label>
+        <input type="password" name="password" required />
+        <button type="submit">Login</button>
+      </form>
+    </div>
+  `;
+  res.send(renderPage({ title: "Login", body, nav: false }));
+});
+
+app.post("/login", async (req, res) => {
+  const password = req.body.password ?? "";
+  const adminPassword = await getSettingValue("admin_password", ADMIN_PASSWORD);
+
+  if (password !== adminPassword) {
+    await log({ type: "auth", message: "invalid admin login" });
+    return res.status(401).send(renderPage({
+      title: "Login",
+      nav: false,
+      body: `<div class="card"><h1>Login failed</h1><p>Invalid password.</p><a href="/login">Try again</a></div>`
+    }));
+  }
+
+  req.session.isAdmin = true;
+  await log({ type: "auth", message: "admin login" });
+  res.redirect("/dashboard");
+});
+
+app.get("/logout", (req, res) => {
+  req.session.destroy(() => {
+    res.redirect("/login");
+  });
+});
+
+app.get("/dashboard", requireLogin, async (req, res) => {
+  const events24h = await countEventsSince(db, 24);
+  const errors24h = await countErrorsSince(db, 24);
+  const deduped24h = await countDedupedSince(db, 24);
+  const dedupRate = events24h ? Math.round((deduped24h / events24h) * 100) : 0;
+  const recentEvents = await listEvents(db, { limit: 10 });
+
+  const body = `
+    <div class="card">
+      <h1>Dashboard</h1>
+      <p class="muted">Gateway status and recent activity snapshot.</p>
+    </div>
+    <div class="grid">
+      <div class="card">
+        <h3>Gateway</h3>
+        <p class="status online">● Online</p>
+      </div>
+      <div class="card">
+        <h3>Events (24h)</h3>
+        <p class="metric">${events24h}</p>
+      </div>
+      <div class="card">
+        <h3>Errors (24h)</h3>
+        <p class="metric">${errors24h}</p>
+      </div>
+      <div class="card">
+        <h3>Approx Dedup Rate</h3>
+        <p class="metric">${dedupRate}%</p>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Recent activity</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Site</th>
+            <th>Event</th>
+            <th>Pixel</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${recentEvents
+            .map(
+              event => `
+            <tr>
+              <td>${formatDate(event.created_at)}</td>
+              <td>${event.site_name ?? "—"}</td>
+              <td><a href="/dashboard/events/${event.id}">${event.event_name ?? "—"}</a></td>
+              <td>${event.pixel_id ?? "—"}</td>
+              <td>${renderStatusPill(event.status)}</td>
+            </tr>
+          `
+            )
+            .join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+
+  res.send(renderPage({ title: "Dashboard", body }));
+});
+
+app.get("/dashboard/sites", requireLogin, async (req, res) => {
+  const sites = await getSites(db);
+
+  const siteCards = await Promise.all(
+    sites.map(async site => {
+      const eventsToday = await countEventsTodayBySite(db, site.site_id);
+      const errorsToday = await countErrorsTodayBySite(db, site.site_id);
+      return `
+        <div class="card site-card">
+          <div class="site-header">
+            <h3>${site.name ?? "Untitled site"}</h3>
+            <span class="muted">Pixel ${site.pixel_id ?? "—"}</span>
+          </div>
+          <p class="muted">Site ID: <code>${site.site_id}</code></p>
+          <p class="muted">Site Key: <code>${site.site_key}</code></p>
+          <div class="site-metrics">
+            <div>
+              <span class="metric">${eventsToday}</span>
+              <span class="muted">events today</span>
+            </div>
+            <div>
+              <span class="metric">${errorsToday}</span>
+              <span class="muted">errors today</span>
+            </div>
+          </div>
+          <div class="actions">
+            <a class="button" href="/dashboard/live?site=${site.site_id}">View Events</a>
+            <a class="button secondary" href="/dashboard/sites/${site.site_id}">Edit Settings</a>
+          </div>
+        </div>
+      `;
+    })
+  );
+
+  const body = `
+    <div class="card">
+      <h1>Sites</h1>
+      <p class="muted">Manage site keys, Meta pixel credentials, and debug toggles.</p>
+    </div>
+    <div class="card">
+      <h2>Create site</h2>
+      <form method="post" action="/dashboard/sites" class="form-grid">
+        <label>Name
+          <input name="name" required />
+        </label>
+        <label>Pixel ID
+          <input name="pixel_id" required />
+        </label>
+        <label>Access Token
+          <input name="access_token" required />
+        </label>
+        <label>Test Event Code
+          <input name="test_event_code" />
+        </label>
+        <label class="checkbox">
+          <input type="checkbox" name="dry_run" />
+          Dry-run mode (log only, do not send to Meta)
+        </label>
+        <label class="checkbox">
+          <input type="checkbox" name="log_full_payloads" checked />
+          Log full payloads (dev only)
+        </label>
+        <button type="submit">Create site</button>
+      </form>
+    </div>
+    <div class="card">
+      <h2>Existing sites</h2>
+      <div class="card-grid">
+        ${siteCards.join("") || "<p class=\"muted\">No sites yet.</p>"}
+      </div>
+    </div>
+  `;
+
+  res.send(renderPage({ title: "Sites", body }));
+});
+
+app.get("/dashboard/sites/:siteId", requireLogin, async (req, res) => {
+  const site = await getSiteById(db, req.params.siteId);
+  if (!site) {
+    return res.status(404).send(renderPage({
+      title: "Site not found",
+      body: `<div class="card"><h1>Site not found</h1></div>`
+    }));
+  }
+
+  const body = `
+    <div class="card">
+      <h1>${site.name ?? "Site settings"}</h1>
+      <p class="muted">Manage ingest auth, Meta config, and debug toggles.</p>
+    </div>
+    <div class="card">
+      <h2>Ingest auth</h2>
+      <p class="muted">Site Key (used in <code>x-site-key</code> header).</p>
+      <div class="inline">
+        <code>${site.site_key}</code>
+        <form method="post" action="/dashboard/sites/${site.site_id}/rotate">
+          <button type="submit" class="danger">Rotate key</button>
+        </form>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Meta config</h2>
+      <form method="post" action="/dashboard/sites/${site.site_id}" class="form-grid">
+        <label>Name
+          <input name="name" value="${site.name ?? ""}" />
+        </label>
+        <label>Pixel ID
+          <input name="pixel_id" value="${site.pixel_id ?? ""}" />
+        </label>
+        <label>Access Token
+          <input name="access_token" value="${site.access_token ?? ""}" />
+        </label>
+        <label>Test Event Code
+          <input name="test_event_code" value="${site.test_event_code ?? ""}" />
+        </label>
+        <label class="checkbox">
+          <input type="checkbox" name="dry_run" ${site.dry_run ? "checked" : ""} />
+          Dry-run mode (log only, do not send to Meta)
+        </label>
+        <label class="checkbox">
+          <input type="checkbox" name="log_full_payloads" ${site.log_full_payloads ? "checked" : ""} />
+          Log full payloads (dev warning)
+        </label>
+        <button type="submit">Save settings</button>
+      </form>
+    </div>
+    <div class="card">
+      <h2>Delete site</h2>
+      <form method="post" action="/dashboard/sites/${site.site_id}/delete">
+        <button type="submit" class="danger">Delete site</button>
+      </form>
+    </div>
+  `;
+
+  res.send(renderPage({ title: "Site settings", body }));
+});
+
+app.post("/dashboard/sites", requireLogin, async (req, res) => {
+  const site_id = uuid();
+  const site_key = uuid();
+  await createSite(db, {
+    site_id,
+    site_key,
+    name: req.body.name,
+    pixel_id: req.body.pixel_id,
+    access_token: req.body.access_token,
+    test_event_code: req.body.test_event_code,
+    dry_run: Boolean(req.body.dry_run),
+    log_full_payloads: req.body.log_full_payloads !== undefined
+  });
+  await log({ type: "admin", message: "site created", site_id });
+  res.redirect("/dashboard/sites");
+});
+
+app.post("/dashboard/sites/:siteId", requireLogin, async (req, res) => {
+  const site_id = req.params.siteId;
+  await updateSite(db, {
+    site_id,
+    name: req.body.name,
+    pixel_id: req.body.pixel_id,
+    access_token: req.body.access_token,
+    test_event_code: req.body.test_event_code,
+    dry_run: Boolean(req.body.dry_run),
+    log_full_payloads: req.body.log_full_payloads !== undefined
+  });
+  await log({ type: "admin", message: "site updated", site_id });
+  res.redirect(`/dashboard/sites/${site_id}`);
+});
+
+app.post("/dashboard/sites/:siteId/rotate", requireLogin, async (req, res) => {
+  const site_id = req.params.siteId;
+  const site_key = uuid();
+  await rotateSiteKey(db, site_id, site_key);
+  await log({ type: "admin", message: "site key rotated", site_id });
+  res.redirect(`/dashboard/sites/${site_id}`);
+});
+
+app.post("/dashboard/sites/:siteId/delete", requireLogin, async (req, res) => {
+  const site_id = req.params.siteId;
+  await deleteSite(db, site_id);
+  await log({ type: "admin", message: "site deleted", site_id });
+  res.redirect("/dashboard/sites");
+});
+
+app.get("/dashboard/live", requireLogin, async (req, res) => {
+  const sites = await getSites(db);
+  const siteOptions = sites
+    .map(site => `<option value="${site.site_id}">${site.name ?? site.site_id}</option>`)
+    .join("");
+
+  const body = `
+    <div class="card">
+      <h1>Live Events</h1>
+      <p class="muted">Auto-refreshing stream (every 2 seconds).</p>
+    </div>
+    <div class="split-pane">
+      <section class="pane pane-list">
+        <div class="filters">
+          <label>Site
+            <select id="filter-site">
+              <option value="">All sites</option>
+              ${siteOptions}
+            </select>
+          </label>
+          <label>Status
+            <select id="filter-status">
+              <option value="">All</option>
+              <option value="success">Success</option>
+              <option value="deduped">Deduped</option>
+              <option value="error">Error</option>
+            </select>
+          </label>
+          <label>Event name
+            <input id="filter-name" placeholder="Purchase" />
+          </label>
+        </div>
+        <div id="event-stream" class="event-stream"></div>
+      </section>
+      <section class="pane pane-detail">
+        <div class="card" id="event-detail">
+          <h2>Event detail</h2>
+          <p class="muted">Select an event to inspect payloads.</p>
+        </div>
+      </section>
+    </div>
+    <script>
+      const streamEl = document.getElementById('event-stream');
+      const detailEl = document.getElementById('event-detail');
+      const filterSite = document.getElementById('filter-site');
+      const filterStatus = document.getElementById('filter-status');
+      const filterName = document.getElementById('filter-name');
+
+      function buildQuery() {
+        const params = new URLSearchParams();
+        if (filterSite.value) params.set('site', filterSite.value);
+        if (filterStatus.value) params.set('status', filterStatus.value);
+        if (filterName.value) params.set('event_name', filterName.value);
+        return params.toString();
+      }
+
+      function renderRow(event) {
+        const row = document.createElement('div');
+        row.className = 'event-row ' + event.status;
+        row.dataset.id = event.id;
+        row.innerHTML =
+          '<div>' +
+            '<strong>' + (event.event_name || '—') + '</strong>' +
+            '<div class="muted">' + (event.site_name || 'Unknown site') + '</div>' +
+          '</div>' +
+          '<div class="muted">' + new Date(event.created_at).toLocaleTimeString() + '</div>' +
+          '<div>' + event.status + '</div>';
+        row.addEventListener('click', () => loadDetail(event.id));
+        return row;
+      }
+
+      async function loadStream() {
+        const response = await fetch('/admin/events?limit=50&' + buildQuery());
+        const events = await response.json();
+        streamEl.innerHTML = '';
+        events.forEach(event => streamEl.appendChild(renderRow(event)));
+      }
+
+      function renderJsonBlock(title, content) {
+        const text = content ? JSON.stringify(content, null, 2) : '—';
+        return '<details open>' +
+          '<summary>' + title + '</summary>' +
+          '<pre>' + text + '</pre>' +
+          '</details>';
+      }
+
+      async function loadDetail(eventId) {
+        const response = await fetch('/admin/events/' + eventId);
+        const event = await response.json();
+        if (!event || !event.id) return;
+        detailEl.innerHTML =
+          '<div class="detail-header">' +
+            '<div>' +
+              '<h2>' + (event.event_name || 'Event detail') + '</h2>' +
+              '<p class="muted">' + (event.site_name || 'Unknown site') + ' · ' + (event.pixel_id || 'No pixel') + ' · ' + new Date(event.created_at).toLocaleString() + '</p>' +
+            '</div>' +
+            '<div class="copy-group">' +
+              '<button onclick=\'navigator.clipboard.writeText(' + JSON.stringify(event.event_id || '') + ')\'>Copy event_id</button>' +
+            '</div>' +
+          '</div>' +
+          '<div class="tabs">' +
+            '<button class="tab-button active" data-tab="inbound">Inbound</button>' +
+            '<button class="tab-button" data-tab="outbound">Outbound → Meta</button>' +
+            '<button class="tab-button" data-tab="meta">Meta Response</button>' +
+          '</div>' +
+          '<div class="tab-content" data-content="inbound">' +
+            renderJsonBlock('Inbound payload', event.inbound_json) +
+            '<button onclick=\'navigator.clipboard.writeText(' + JSON.stringify(JSON.stringify(event.inbound_json || {}, null, 2)) + ')\'>Copy inbound</button>' +
+          '</div>' +
+          '<div class="tab-content hidden" data-content="outbound">' +
+            renderJsonBlock('Outbound payload', event.outbound_json) +
+            '<button onclick=\'navigator.clipboard.writeText(' + JSON.stringify(JSON.stringify(event.outbound_json || {}, null, 2)) + ')\'>Copy outbound</button>' +
+          '</div>' +
+          '<div class="tab-content hidden" data-content="meta">' +
+            renderJsonBlock('Meta response', { status: event.meta_status, body: event.meta_body }) +
+            '<button onclick=\'navigator.clipboard.writeText(' + JSON.stringify(JSON.stringify({ status: event.meta_status, body: event.meta_body }, null, 2)) + ')\'>Copy response</button>' +
+          '</div>';
+
+        detailEl.querySelectorAll('.tab-button').forEach(button => {
+          button.addEventListener('click', () => {
+            detailEl.querySelectorAll('.tab-button').forEach(btn => btn.classList.remove('active'));
+            detailEl.querySelectorAll('.tab-content').forEach(content => content.classList.add('hidden'));
+            button.classList.add('active');
+            detailEl.querySelector('.tab-content[data-content="' + button.dataset.tab + '"]').classList.remove('hidden');
+          });
+        });
+      }
+
+      [filterSite, filterStatus].forEach(el => el.addEventListener('change', loadStream));
+      filterName.addEventListener('input', () => {
+        if (filterName.value.length === 0 || filterName.value.length > 2) {
+          loadStream();
+        }
+      });
+
+      const urlParams = new URLSearchParams(window.location.search);
+      if (urlParams.get('site')) filterSite.value = urlParams.get('site');
+
+      loadStream();
+      setInterval(loadStream, 2000);
+    </script>
+  `;
+  res.send(renderPage({ title: "Live Events", body }));
+});
+
+app.get("/dashboard/events/:eventId", requireLogin, async (req, res) => {
+  const event = await getEventById(db, req.params.eventId);
+  if (!event) {
+    return res.status(404).send(renderPage({
+      title: "Event not found",
+      body: `<div class="card"><h1>Event not found</h1></div>`
+    }));
+  }
+
+  const body = `
+    <div class="card">
+      <h1>${event.event_name ?? "Event detail"}</h1>
+      <p class="muted">${event.site_name ?? "Unknown site"} · ${event.pixel_id ?? "No pixel"} · ${formatDate(event.created_at)}</p>
+      <p class="muted">Event ID: <code>${event.event_id ?? "—"}</code></p>
+    </div>
+    <div class="card">
+      <h2>Inbound payload</h2>
+      <pre>${JSON.stringify(event.inbound_json ?? {}, null, 2)}</pre>
+    </div>
+    <div class="card">
+      <h2>Outbound payload</h2>
+      <pre>${JSON.stringify(event.outbound_json ?? {}, null, 2)}</pre>
+    </div>
+    <div class="card">
+      <h2>Meta response</h2>
+      <pre>${JSON.stringify({ status: event.meta_status, body: event.meta_body }, null, 2)}</pre>
+    </div>
+  `;
+
+  res.send(renderPage({ title: "Event detail", body }));
+});
+
+app.get("/dashboard/errors", requireLogin, async (req, res) => {
+  const selectedType = req.query.type;
+  const groups = await listErrorGroups(db);
+  let detailHtml = "<p class=\"muted\">Select an error type to inspect details.</p>";
+
+  if (selectedType) {
+    const errors = await listErrors(db, { type: selectedType, limit: 10 });
+    const relatedEvents = await listRecentEventsForError(db, selectedType, 5);
+    const latest = errors[0];
+
+    detailHtml = `
+      <div class="card">
+        <h2>${selectedType} errors</h2>
+        <p class="muted">${getErrorSuggestion(selectedType)}</p>
+        <h3>Latest response</h3>
+        <pre>${JSON.stringify({ status: latest?.meta_status, body: latest?.meta_body }, null, 2)}</pre>
+        <h3>Recent events</h3>
+        <ul>
+          ${relatedEvents
+            .map(
+              event => `
+            <li>
+              <strong>${event.event_name ?? "—"}</strong> (${event.status}) – ${event.site_name ?? "Unknown site"} – ${formatDate(event.created_at)}
+            </li>
+          `
+            )
+            .join("")}
+        </ul>
+      </div>
+    `;
+  }
+
+  const body = `
+    <div class="card">
+      <h1>Errors</h1>
+      <p class="muted">Grouped by type with suggested resolution.</p>
+    </div>
+    <div class="grid">
+      ${groups
+        .map(
+          group => `
+        <a class="card link-card" href="/dashboard/errors?type=${group.type}">
+          <h3>${group.type}</h3>
+          <p class="metric">${group.count}</p>
+        </a>
+      `
+        )
+        .join("")}
+    </div>
+    ${detailHtml}
+  `;
+
+  res.send(renderPage({ title: "Errors", body }));
+});
+
+app.get("/dashboard/settings", requireLogin, async (req, res) => {
+  const settings = Object.fromEntries((await listSettings(db)).map(s => [s.key, s.value]));
+  const body = `
+    <div class="card">
+      <h1>Settings</h1>
+      <p class="muted">Global configuration applied immediately.</p>
+      <form method="post" action="/dashboard/settings" class="form-grid">
+        <label>Admin password
+          <input name="admin_password" type="password" value="${settings.admin_password ?? ""}" />
+        </label>
+        <label>Default Meta API version
+          <input name="default_meta_api_version" value="${settings.default_meta_api_version ?? "v19.0"}" />
+        </label>
+        <label>Retry count
+          <input name="retry_count" value="${settings.retry_count ?? "1"}" />
+        </label>
+        <label>Dedup TTL (hours)
+          <input name="dedup_ttl_hours" value="${settings.dedup_ttl_hours ?? "48"}" />
+        </label>
+        <label>Log retention (hours)
+          <input name="log_retention_hours" value="${settings.log_retention_hours ?? "168"}" />
+        </label>
+        <label>Rate limit per minute
+          <input name="rate_limit_per_min" value="${settings.rate_limit_per_min ?? "60"}" />
+        </label>
+        <label>Require HMAC (true/false)
+          <input name="hmac_required" value="${settings.hmac_required ?? "false"}" />
+        </label>
+        <label>HMAC secret
+          <input name="hmac_secret" value="${settings.hmac_secret ?? ""}" />
+        </label>
+        <button type="submit">Save settings</button>
+      </form>
+    </div>
+  `;
+  res.send(renderPage({ title: "Settings", body }));
+});
+
+app.post("/dashboard/settings", requireLogin, async (req, res) => {
+  await setSetting(db, "admin_password", req.body.admin_password || ADMIN_PASSWORD);
+  await setSetting(db, "default_meta_api_version", req.body.default_meta_api_version || "v19.0");
+  await setSetting(db, "retry_count", req.body.retry_count || "1");
+  await setSetting(db, "dedup_ttl_hours", req.body.dedup_ttl_hours || "48");
+  await setSetting(db, "log_retention_hours", req.body.log_retention_hours || "168");
+  await setSetting(db, "rate_limit_per_min", req.body.rate_limit_per_min || "60");
+  await setSetting(db, "hmac_required", req.body.hmac_required || "false");
+  await setSetting(db, "hmac_secret", req.body.hmac_secret || "");
+  await log({ type: "admin", message: "settings updated" });
+  res.redirect("/dashboard/settings");
+});
+
+app.get("/admin/events", requireLogin, async (req, res) => {
+  const limit = Number.parseInt(req.query.limit ?? "50", 10);
+  const events = await listEvents(db, {
+    limit: Number.isNaN(limit) ? 50 : limit,
+    siteId: req.query.site || undefined,
+    status: req.query.status || undefined,
+    eventName: req.query.event_name || undefined
+  });
+  res.json(events);
+});
+
+app.get("/admin/events/:eventId", requireLogin, async (req, res) => {
+  const event = await getEventById(db, req.params.eventId);
+  if (!event) return res.status(404).json({ error: "not found" });
+  res.json(event);
+});
+
 app.post("/collect", async (req, res) => {
   const siteKey = req.headers["x-site-key"];
   const site = siteKey ? await getSiteByKey(db, siteKey) : null;
 
   if (!site) {
-    await log({ type: "error", message: "invalid site key" });
+    await insertError(db, { type: "auth", message: "invalid site key" });
+    await log({ type: "auth", message: "invalid site key" });
     return res.status(401).json({ error: "invalid site key" });
   }
 
   const limitPerMinute = await getSettingNumber("rate_limit_per_min", 60);
   if (!checkRateLimit(site.site_id, limitPerMinute)) {
+    await insertError(db, { type: "validation", site_id: site.site_id, message: "rate limit exceeded" });
     await log({ type: "rate_limit", message: "rate limit exceeded", site_id: site.site_id });
     return res.status(429).json({ error: "rate limit exceeded" });
   }
@@ -436,21 +874,30 @@ app.post("/collect", async (req, res) => {
 
   if (hmacRequired) {
     if (!hmacSecret) {
+      await insertError(db, { type: "validation", site_id: site.site_id, message: "hmac secret missing" });
       await log({ type: "error", message: "hmac required but secret missing", site_id: site.site_id });
       return res.status(500).json({ error: "hmac secret not configured" });
     }
     if (!signature || !verifySignature({ secret: hmacSecret, rawBody: req.rawBody ?? "", signature })) {
+      await insertError(db, { type: "auth", site_id: site.site_id, message: "invalid signature" });
       await log({ type: "error", message: "invalid signature", site_id: site.site_id });
       return res.status(401).json({ error: "invalid signature" });
     }
   } else if (signature && hmacSecret) {
     if (!verifySignature({ secret: hmacSecret, rawBody: req.rawBody ?? "", signature })) {
+      await insertError(db, { type: "auth", site_id: site.site_id, message: "invalid signature" });
       await log({ type: "error", message: "invalid signature", site_id: site.site_id });
       return res.status(401).json({ error: "invalid signature" });
     }
   }
 
   const inboundEvent = { ...req.body };
+
+  if (!inboundEvent.event_name || !inboundEvent.event_time) {
+    await insertError(db, { type: "validation", site_id: site.site_id, message: "missing event_name or event_time" });
+    return res.status(400).json({ error: "event_name and event_time are required" });
+  }
+
   let eventId = inboundEvent.event_id;
 
   if (!eventId) {
@@ -472,9 +919,18 @@ app.post("/collect", async (req, res) => {
     }
   }
 
+  const dedupTtlHours = await getSettingNumber("dedup_ttl_hours", 48);
+
   if (eventId) {
-    const seen = await hasRecentEventId(db, site.site_id, eventId);
+    const seen = await hasRecentEventId(db, site.site_id, eventId, dedupTtlHours);
     if (seen) {
+      await insertEvent(db, {
+        site_id: site.site_id,
+        event_id: eventId,
+        event_name: inboundEvent.event_name,
+        status: "deduped",
+        inbound_json: JSON.stringify(sanitizePayload(inboundEvent, site.log_full_payloads === 1))
+      });
       await log({
         type: "dedup",
         message: "duplicate event suppressed",
@@ -483,7 +939,7 @@ app.post("/collect", async (req, res) => {
       });
       return res.json({ ok: true, deduped: true });
     }
-    await storeEventId(db, site.site_id, eventId);
+    await storeEventId(db, site.site_id, eventId, dedupTtlHours);
   }
 
   const payload = {
@@ -491,26 +947,91 @@ app.post("/collect", async (req, res) => {
     test_event_code: site.test_event_code
   };
 
-  const url = `https://graph.facebook.com/v19.0/${site.pixel_id}/events?access_token=${site.access_token}`;
+  const apiVersion = await getSettingValue("default_meta_api_version", "v19.0");
+  const url = `https://graph.facebook.com/${apiVersion}/${site.pixel_id}/events?access_token=${site.access_token}`;
+
+  const outboundLog = JSON.stringify({
+    ...payload,
+    data: [sanitizePayload(inboundEvent, site.log_full_payloads === 1)]
+  });
+  const inboundLog = JSON.stringify(sanitizePayload(inboundEvent, site.log_full_payloads === 1));
+
+  if (site.dry_run) {
+    const eventDbId = await insertEvent(db, {
+      site_id: site.site_id,
+      event_id: eventId,
+      event_name: inboundEvent.event_name,
+      status: "success",
+      inbound_json: inboundLog,
+      outbound_json: outboundLog,
+      meta_status: 0,
+      meta_body: JSON.stringify({ dry_run: true })
+    });
+    await cleanupRetention(db, await getSettingNumber("log_retention_hours", 168));
+    await log({ type: "event", site_id: site.site_id, message: "dry run", event_db_id: eventDbId });
+    return res.json({ ok: true, dry_run: true });
+  }
 
   try {
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(payload)
-    });
-    const result = await response.json();
+    const retryCount = await getSettingNumber("retry_count", 1);
+    const { response, body } = await sendToMeta({ url, payload, retryCount });
+    const status = response.status;
 
+    const eventDbId = await insertEvent(db, {
+      site_id: site.site_id,
+      event_id: eventId,
+      event_name: inboundEvent.event_name,
+      status: response.ok ? "success" : "error",
+      inbound_json: inboundLog,
+      outbound_json: outboundLog,
+      meta_status: status,
+      meta_body: JSON.stringify(body)
+    });
+
+    if (!response.ok) {
+      const errorType = status >= 500 ? "meta_5xx" : "meta_4xx";
+      await insertError(db, {
+        type: errorType,
+        site_id: site.site_id,
+        event_db_id: eventDbId,
+        event_id: eventId,
+        message: "Meta API error",
+        meta_status: status,
+        meta_body: JSON.stringify(body)
+      });
+    }
+
+    await cleanupRetention(db, await getSettingNumber("log_retention_hours", 168));
     await log({
       type: "event",
       site_id: site.site_id,
       message: inboundEvent.event_name,
-      status: response.status,
-      meta: { request: inboundEvent, response: result }
+      status: status,
+      meta: { response: body }
     });
 
-    res.json({ ok: true, meta: result });
+    res.status(response.ok ? 200 : status).json({ ok: response.ok, meta: body });
   } catch (err) {
+    const eventDbId = await insertEvent(db, {
+      site_id: site.site_id,
+      event_id: eventId,
+      event_name: inboundEvent.event_name,
+      status: "error",
+      inbound_json: inboundLog,
+      outbound_json: outboundLog,
+      meta_status: null,
+      meta_body: JSON.stringify({ error: err.toString() })
+    });
+
+    await insertError(db, {
+      type: "network",
+      site_id: site.site_id,
+      event_db_id: eventDbId,
+      event_id: eventId,
+      message: err.toString()
+    });
+
+    await cleanupRetention(db, await getSettingNumber("log_retention_hours", 168));
     await log({ type: "error", error: err.toString(), site_id: site.site_id });
     res.status(500).json({ error: "failed to send to meta" });
   }
