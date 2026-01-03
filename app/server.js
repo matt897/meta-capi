@@ -62,7 +62,7 @@ if (!fs.existsSync(dbDir)) {
 const db = await initDb(DB_PATH);
 
 await ensureSetting(db, "admin_password", ADMIN_PASSWORD);
-await ensureSetting(db, "default_meta_api_version", "v19.0");
+await ensureSetting(db, "default_meta_api_version", "v24.0");
 await ensureSetting(db, "retry_count", "1");
 await ensureSetting(db, "dedup_ttl_hours", "48");
 await ensureSetting(db, "log_retention_hours", "168");
@@ -314,6 +314,15 @@ function getForwardedFor(req) {
 
 function getClientIp(req) {
   return getForwardedFor(req) || req.ip || null;
+}
+
+function resolveEventSourceUrl(event, req) {
+  if (event.event_source_url) return event.event_source_url;
+  const referer = req.get("referer");
+  if (referer) return referer;
+  const origin = req.get("origin");
+  if (origin) return origin;
+  return null;
 }
 
 function enrichUserData(event, req) {
@@ -666,7 +675,7 @@ async function sendTestEvent({ site, eventType, overrides }) {
     };
   }
 
-  const apiVersion = await getSettingValue("default_meta_api_version", "v19.0");
+  const apiVersion = await getSettingValue("default_meta_api_version", "v24.0");
   const url = `https://graph.facebook.com/${apiVersion}/${site.pixel_id}/events?access_token=${site.access_token}`;
 
   try {
@@ -1709,7 +1718,7 @@ app.get("/dashboard/settings", requireLogin, async (req, res) => {
           <input name="admin_password" type="password" value="${settings.admin_password ?? ""}" />
         </label>
         <label>Default Meta API version
-          <input name="default_meta_api_version" value="${settings.default_meta_api_version ?? "v19.0"}" />
+          <input name="default_meta_api_version" value="${settings.default_meta_api_version ?? "v24.0"}" />
         </label>
         <label>Retry count
           <input name="retry_count" value="${settings.retry_count ?? "1"}" />
@@ -1738,7 +1747,7 @@ app.get("/dashboard/settings", requireLogin, async (req, res) => {
 
 app.post("/dashboard/settings", requireLogin, async (req, res) => {
   await setSetting(db, "admin_password", req.body.admin_password || ADMIN_PASSWORD);
-  await setSetting(db, "default_meta_api_version", req.body.default_meta_api_version || "v19.0");
+  await setSetting(db, "default_meta_api_version", req.body.default_meta_api_version || "v24.0");
   await setSetting(db, "retry_count", req.body.retry_count || "1");
   await setSetting(db, "dedup_ttl_hours", req.body.dedup_ttl_hours || "48");
   await setSetting(db, "log_retention_hours", req.body.log_retention_hours || "168");
@@ -1813,6 +1822,18 @@ app.post("/collect", async (req, res) => {
     return res.status(400).json({ error: "event_name and event_time are required" });
   }
 
+  if (!inboundEvent.action_source) {
+    inboundEvent.action_source = "website";
+  }
+
+  if (inboundEvent.action_source === "website") {
+    inboundEvent.event_source_url = resolveEventSourceUrl(inboundEvent, req);
+    if (!inboundEvent.event_source_url) {
+      await insertError(db, { type: "validation", site_id: site.site_id, message: "missing event_source_url" });
+      return res.status(400).json({ error: "event_source_url is required for website events" });
+    }
+  }
+
   const userData = enrichUserData(inboundEvent, req);
   const minimumUserDataPresent = hasMinimumUserData(userData);
 
@@ -1865,7 +1886,7 @@ app.post("/collect", async (req, res) => {
     test_event_code: site.test_event_code
   };
 
-  const apiVersion = await getSettingValue("default_meta_api_version", "v19.0");
+  const apiVersion = await getSettingValue("default_meta_api_version", "v24.0");
   const url = `https://graph.facebook.com/${apiVersion}/${site.pixel_id}/events?access_token=${site.access_token}`;
 
   const outboundLog = JSON.stringify({
