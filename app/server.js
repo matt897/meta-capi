@@ -220,6 +220,25 @@ function buildVideoSnippet({ host, siteKey, videoId, selector }) {
 </script>`;
 }
 
+const VIDEO_MODE_LABELS = {
+  off: "Off",
+  test: "Test",
+  live: "Live"
+};
+
+const VIDEO_MODE_HINTS = {
+  off: "Not sending to Meta",
+  test: "Using test_event_code",
+  live: "Sending production events"
+};
+
+function normalizeVideoMode(value) {
+  if (value === "off" || value === "test" || value === "live") {
+    return value;
+  }
+  return "test";
+}
+
 function getSiteStatus(site) {
   if (!site.pixel_id || !site.access_token) {
     return "not_configured";
@@ -814,7 +833,12 @@ app.get("/sdk/config", async (req, res) => {
     return res.json({ enabled: false });
   }
 
-  res.json({ enabled: true, milestones: [25, 50, 75, 95] });
+  const mode = normalizeVideoMode(video.mode);
+  res.json({
+    enabled: mode !== "off",
+    mode,
+    milestones: [25, 50, 75, 95]
+  });
 });
 
 app.get("/sdk/video-tracker.js", (req, res) => {
@@ -1681,6 +1705,7 @@ app.get("/dashboard/videos", requireLogin, async (req, res) => {
       selector: video.selector
     });
     const encodedSnippet = encodeURIComponent(snippet);
+    const mode = normalizeVideoMode(video.mode);
     return `
       <tr>
         <td>
@@ -1690,6 +1715,10 @@ app.get("/dashboard/videos", requireLogin, async (req, res) => {
         <td>${video.site_name ?? "—"}</td>
         <td>${video.page_url ?? "—"}</td>
         <td>${video.enabled ? renderStatusPill("enabled") : renderStatusPill("disabled")}</td>
+        <td>
+          ${renderStatusPill(mode)}
+          <div class="table-hint">${VIDEO_MODE_HINTS[mode]}</div>
+        </td>
         <td>
           <div class="actions">
             <a class="button secondary" href="/dashboard/videos/${video.id}">Edit</a>
@@ -1724,11 +1753,12 @@ app.get("/dashboard/videos", requireLogin, async (req, res) => {
             <th>Site</th>
             <th>Page URL</th>
             <th>Status</th>
+            <th>Mode</th>
             <th>Actions</th>
           </tr>
         </thead>
         <tbody>
-          ${rows.join("") || "<tr><td colspan=\"5\" class=\"muted\">No videos yet.</td></tr>"}
+          ${rows.join("") || "<tr><td colspan=\"6\" class=\"muted\">No videos yet.</td></tr>"}
         </tbody>
       </table>
     </div>
@@ -1752,12 +1782,14 @@ app.get("/dashboard/videos/new", requireLogin, async (req, res) => {
   const siteOptions = sites
     .map(site => `<option value="${site.site_id}">${site.name ?? site.site_id}</option>`)
     .join("");
+  const warning = req.query.warning ? `<div class="banner warning">${req.query.warning}</div>` : "";
 
   const body = `
     <div class="card">
       <h1>Add Video</h1>
       <p class="muted">Register a video page and generate a snippet for tracking.</p>
     </div>
+    ${warning}
     <div class="card">
       <form method="post" action="/dashboard/videos" class="form-grid">
         <label>Site
@@ -1778,6 +1810,14 @@ app.get("/dashboard/videos/new", requireLogin, async (req, res) => {
         </label>
         <label>CSS selector
           <input name="selector" value="video" />
+        </label>
+        <label>Mode
+          <select name="mode">
+            <option value="off">Off (log only)</option>
+            <option value="test" selected>Test (send to Meta Test Events)</option>
+            <option value="live">Live (send to Meta Production)</option>
+          </select>
+          <span class="muted">Test mode requires a site test_event_code. Live mode impacts optimization/reporting.</span>
         </label>
         <label class="checkbox">
           <input type="checkbox" name="enabled" checked />
@@ -1811,6 +1851,12 @@ app.post("/dashboard/videos", requireLogin, async (req, res) => {
     }));
   }
 
+  const mode = normalizeVideoMode(req.body.mode);
+  let warningParam = "";
+  if (mode === "test" && !site.test_event_code) {
+    warningParam = "&warning=" + encodeURIComponent("Test mode selected, but this site has no test_event_code. Events will be logged but not forwarded.");
+  }
+
   const id = uuid();
   await createVideo(db, {
     id,
@@ -1819,10 +1865,11 @@ app.post("/dashboard/videos", requireLogin, async (req, res) => {
     name: req.body.name || null,
     page_url: req.body.page_url || null,
     selector: req.body.selector || "video",
-    enabled: req.body.enabled !== undefined
+    enabled: req.body.enabled !== undefined,
+    mode
   });
   await log({ type: "admin", message: "video created", site_id: site.site_id, video_id: videoSlug });
-  res.redirect(`/dashboard/videos/${id}?notice=Video%20created`);
+  res.redirect(`/dashboard/videos/${id}?notice=Video%20created${warningParam}`);
 });
 
 app.get("/dashboard/videos/:videoDbId", requireLogin, async (req, res) => {
@@ -1833,6 +1880,7 @@ app.get("/dashboard/videos/:videoDbId", requireLogin, async (req, res) => {
       body: `<div class="card"><h1>Video not found</h1></div>`
     }));
   }
+  const activeSite = await getSiteById(db, video.site_id);
   const sites = await getSites(db);
   const siteOptions = sites
     .map(site => `<option value="${site.site_id}" ${site.site_id === video.site_id ? "selected" : ""}>${site.name ?? site.site_id}</option>`)
@@ -1845,6 +1893,16 @@ app.get("/dashboard/videos/:videoDbId", requireLogin, async (req, res) => {
     selector: video.selector
   });
   const notice = req.query.notice ? `<div class="banner info">${req.query.notice}</div>` : "";
+  const warning = req.query.warning ? `<div class="banner warning">${req.query.warning}</div>` : "";
+  const mode = normalizeVideoMode(video.mode);
+  const warnings = [];
+  if (mode === "test" && !activeSite?.test_event_code) {
+    warnings.push("Test mode is selected, but this site has no test_event_code. Events will be logged but not forwarded.");
+  }
+  if (mode === "live") {
+    warnings.push("Live mode sends production events and impacts optimization/reporting.");
+  }
+  const modeWarning = warnings.length ? `<div class="banner warning">${warnings.join(" ")}</div>` : "";
 
   const body = `
     <div class="card">
@@ -1852,6 +1910,8 @@ app.get("/dashboard/videos/:videoDbId", requireLogin, async (req, res) => {
       <p class="muted">Update tracking settings or revoke tracking instantly.</p>
     </div>
     ${notice}
+    ${warning}
+    ${modeWarning}
     <div class="card">
       <form method="post" action="/dashboard/videos/${video.id}" class="form-grid">
         <label>Site
@@ -1870,6 +1930,14 @@ app.get("/dashboard/videos/:videoDbId", requireLogin, async (req, res) => {
         </label>
         <label>CSS selector
           <input name="selector" value="${video.selector ?? "video"}" />
+        </label>
+        <label>Mode
+          <select name="mode">
+            <option value="off" ${mode === "off" ? "selected" : ""}>Off (log only)</option>
+            <option value="test" ${mode === "test" ? "selected" : ""}>Test (send to Meta Test Events)</option>
+            <option value="live" ${mode === "live" ? "selected" : ""}>Live (send to Meta Production)</option>
+          </select>
+          <span class="muted">${VIDEO_MODE_HINTS[mode]}</span>
         </label>
         <label class="checkbox">
           <input type="checkbox" name="enabled" ${video.enabled ? "checked" : ""} />
@@ -1935,6 +2003,14 @@ app.post("/dashboard/videos/:videoDbId", requireLogin, async (req, res) => {
     }));
   }
 
+  const mode = normalizeVideoMode(req.body.mode);
+  let warningParam = "";
+  if (mode === "test" && !site.test_event_code) {
+    warningParam = "&warning=" + encodeURIComponent("Test mode selected, but this site has no test_event_code. Events will be logged but not forwarded.");
+  } else if (mode === "live") {
+    warningParam = "&warning=" + encodeURIComponent("Live mode sends production events and impacts optimization/reporting.");
+  }
+
   await updateVideo(db, {
     id: video.id,
     site_id: site.site_id,
@@ -1942,10 +2018,11 @@ app.post("/dashboard/videos/:videoDbId", requireLogin, async (req, res) => {
     name: req.body.name || null,
     page_url: req.body.page_url || null,
     selector: req.body.selector || "video",
-    enabled: req.body.enabled !== undefined
+    enabled: req.body.enabled !== undefined,
+    mode
   });
   await log({ type: "admin", message: "video updated", site_id: site.site_id, video_id: videoSlug });
-  res.redirect(`/dashboard/videos/${video.id}?notice=Video%20updated`);
+  res.redirect(`/dashboard/videos/${video.id}?notice=Video%20updated${warningParam}`);
 });
 
 app.post("/dashboard/videos/:videoDbId/toggle", requireLogin, async (req, res) => {
@@ -1963,7 +2040,8 @@ app.post("/dashboard/videos/:videoDbId/toggle", requireLogin, async (req, res) =
     name: video.name,
     page_url: video.page_url,
     selector: video.selector,
-    enabled: !video.enabled
+    enabled: !video.enabled,
+    mode: video.mode
   });
   await log({
     type: "admin",
@@ -2081,11 +2159,13 @@ app.get("/dashboard/live", requireLogin, async (req, res) => {
         const event = await response.json();
         if (!event || !event.id) return;
         const outboundReason = event.meta_body && event.meta_body.reason ? event.meta_body.reason : null;
+        const videoModeLine = event.video_mode ? '<p class="muted">Video mode: <strong>' + event.video_mode + '</strong></p>' : '';
         detailEl.innerHTML =
           '<div class="detail-header">' +
             '<div>' +
               '<h2>' + (event.event_name || 'Event detail') + '</h2>' +
               '<p class="muted">' + (event.site_name || 'Unknown site') + ' · ' + (event.pixel_id || 'No pixel') + ' · ' + new Date(event.created_at).toLocaleString() + '</p>' +
+              videoModeLine +
             '</div>' +
             '<div class="copy-group">' +
               '<button onclick=\'navigator.clipboard.writeText(' + JSON.stringify(event.event_id || '') + ')\'>Copy event_id</button>' +
@@ -2159,6 +2239,7 @@ app.get("/dashboard/events/:eventId", requireLogin, async (req, res) => {
       <p class="muted">${maskedEvent.site_name ?? "Unknown site"} · ${maskedEvent.pixel_id ?? "No pixel"} · ${formatDate(maskedEvent.created_at)}</p>
       <p class="muted">Event ID: <code>${maskedEvent.event_id ?? "—"}</code></p>
       ${maskedEvent.video_id ? `<p class="muted">Video ID: <code>${maskedEvent.video_id}</code> · ${maskedEvent.percent ?? "—"}%</p>` : ""}
+      ${maskedEvent.video_mode ? `<p class="muted">Video mode: <strong>${maskedEvent.video_mode}</strong></p>` : ""}
     </div>
     <div class="card">
       <h2>Inbound payload</h2>
@@ -2333,9 +2414,17 @@ app.post("/v/track", async (req, res) => {
 
   const video = await getVideoBySiteAndVideoId(db, site.site_id, video_id);
   if (!video || !video.enabled) {
+    await log({
+      type: "video_event_skipped",
+      message: "video disabled",
+      site_id: site.site_id,
+      video_id,
+      percent
+    });
     return res.json({ ok: false, reason: "video_disabled" });
   }
 
+  const mode = normalizeVideoMode(video.mode);
   const percentValue = Number.parseInt(percent, 10);
   const eventName = Number.isFinite(percentValue) ? `Video${percentValue}` : "Video";
   const resolvedSourceUrl = event_source_url || video.page_url || resolveEventSourceUrl({}, req) || "";
@@ -2366,6 +2455,14 @@ app.post("/v/track", async (req, res) => {
     }
   };
 
+  await log({
+    type: "video_event_inbound",
+    site_id: site.site_id,
+    video_id,
+    percent: percentValue,
+    mode
+  });
+
   const dedupTtlHours = await getSettingNumber("dedup_ttl_hours", 48);
   const seen = await hasRecentEventId(db, site.site_id, event_id, dedupTtlHours);
   if (seen) {
@@ -2377,7 +2474,8 @@ app.post("/v/track", async (req, res) => {
       percent: percentValue,
       event_source_url: resolvedSourceUrl,
       status: "deduped",
-      inbound_json: JSON.stringify(sanitizePayload(inboundEvent, site.log_full_payloads === 1))
+      inbound_json: JSON.stringify(sanitizePayload(inboundEvent, site.log_full_payloads === 1)),
+      video_mode: mode
     });
     await log({
       type: "dedup",
@@ -2396,6 +2494,60 @@ app.post("/v/track", async (req, res) => {
   });
   const inboundLog = JSON.stringify(sanitizePayload(inboundEvent, site.log_full_payloads === 1));
 
+  if (mode === "off") {
+    await insertEvent(db, {
+      site_id: site.site_id,
+      event_id,
+      event_name: inboundEvent.event_name,
+      video_id,
+      percent: percentValue,
+      event_source_url: resolvedSourceUrl,
+      status: "outbound_skipped",
+      inbound_json: inboundLog,
+      outbound_json: outboundLog,
+      meta_status: 0,
+      meta_body: JSON.stringify({ reason: "video_mode_off" }),
+      video_mode: mode
+    });
+    await cleanupRetention(db, await getSettingNumber("log_retention_hours", 168));
+    await log({
+      type: "video_event_skipped",
+      reason: "video_mode_off",
+      site_id: site.site_id,
+      video_id,
+      percent: percentValue,
+      mode
+    });
+    return res.json({ ok: true, forwarded: false, reason: "video_mode_off" });
+  }
+
+  if (mode === "test" && !site.test_event_code) {
+    await insertEvent(db, {
+      site_id: site.site_id,
+      event_id,
+      event_name: inboundEvent.event_name,
+      video_id,
+      percent: percentValue,
+      event_source_url: resolvedSourceUrl,
+      status: "outbound_skipped",
+      inbound_json: inboundLog,
+      outbound_json: outboundLog,
+      meta_status: 0,
+      meta_body: JSON.stringify({ reason: "missing_test_event_code" }),
+      video_mode: mode
+    });
+    await cleanupRetention(db, await getSettingNumber("log_retention_hours", 168));
+    await log({
+      type: "video_event_skipped",
+      reason: "missing_test_event_code",
+      site_id: site.site_id,
+      video_id,
+      percent: percentValue,
+      mode
+    });
+    return res.json({ ok: true, forwarded: false, reason: "missing_test_event_code" });
+  }
+
   if (!site.pixel_id || !site.access_token) {
     await insertEvent(db, {
       site_id: site.site_id,
@@ -2408,9 +2560,18 @@ app.post("/v/track", async (req, res) => {
       inbound_json: inboundLog,
       outbound_json: outboundLog,
       meta_status: 0,
-      meta_body: JSON.stringify({ reason: "missing_credentials" })
+      meta_body: JSON.stringify({ reason: "missing_credentials" }),
+      video_mode: mode
     });
     await cleanupRetention(db, await getSettingNumber("log_retention_hours", 168));
+    await log({
+      type: "video_event_skipped",
+      reason: "missing_credentials",
+      site_id: site.site_id,
+      video_id,
+      percent: percentValue,
+      mode
+    });
     return res.json({ ok: true, forwarded: false, reason: "missing_credentials" });
   }
 
@@ -2427,9 +2588,18 @@ app.post("/v/track", async (req, res) => {
       inbound_json: inboundLog,
       outbound_json: outboundLog,
       meta_status: 0,
-      meta_body: JSON.stringify({ reason })
+      meta_body: JSON.stringify({ reason }),
+      video_mode: mode
     });
     await cleanupRetention(db, await getSettingNumber("log_retention_hours", 168));
+    await log({
+      type: "video_event_skipped",
+      reason,
+      site_id: site.site_id,
+      video_id,
+      percent: percentValue,
+      mode
+    });
     return res.json({ ok: true, forwarded: false, reason });
   }
 
@@ -2445,14 +2615,26 @@ app.post("/v/track", async (req, res) => {
       inbound_json: inboundLog,
       outbound_json: outboundLog,
       meta_status: 0,
-      meta_body: JSON.stringify({ reason: "insufficient_user_data" })
+      meta_body: JSON.stringify({ reason: "insufficient_user_data" }),
+      video_mode: mode
     });
     await cleanupRetention(db, await getSettingNumber("log_retention_hours", 168));
+    await log({
+      type: "video_event_skipped",
+      reason: "insufficient_user_data",
+      site_id: site.site_id,
+      video_id,
+      percent: percentValue,
+      mode
+    });
     return res.json({ ok: true, forwarded: false, reason: "insufficient_user_data" });
   }
 
   const apiVersion = await getSettingValue("default_meta_api_version", "v24.0");
   const url = `https://graph.facebook.com/${apiVersion}/${site.pixel_id}/events?access_token=${site.access_token}`;
+  if (mode === "test") {
+    payload.test_event_code = site.test_event_code;
+  }
 
   try {
     const retryCount = await getSettingNumber("retry_count", 1);
@@ -2470,7 +2652,8 @@ app.post("/v/track", async (req, res) => {
       inbound_json: inboundLog,
       outbound_json: outboundLog,
       meta_status: status,
-      meta_body: JSON.stringify(body)
+      meta_body: JSON.stringify(body),
+      video_mode: mode
     });
 
     if (!response.ok) {
@@ -2486,6 +2669,15 @@ app.post("/v/track", async (req, res) => {
     }
 
     await cleanupRetention(db, await getSettingNumber("log_retention_hours", 168));
+    await log({
+      type: "video_event_sent",
+      site_id: site.site_id,
+      video_id,
+      percent: percentValue,
+      mode,
+      meta_status: status,
+      meta_response: body
+    });
     res.status(response.ok ? 200 : status).json({
       ok: response.ok,
       forwarded: true,
@@ -2504,7 +2696,8 @@ app.post("/v/track", async (req, res) => {
       inbound_json: inboundLog,
       outbound_json: outboundLog,
       meta_status: null,
-      meta_body: JSON.stringify({ error: err.toString() })
+      meta_body: JSON.stringify({ error: err.toString() }),
+      video_mode: mode
     });
 
     await insertError(db, {
