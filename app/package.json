@@ -1,0 +1,9 @@
+{
+  "name": "meta-capi-gateway",
+  "version": "0.1.0",
+  "type": "module",
+  "dependencies": {
+    "express": "^4.19.2",
+    "uuid": "^9.0.1"
+  }
+}

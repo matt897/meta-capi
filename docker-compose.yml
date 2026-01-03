@@ -1,0 +1,13 @@
+services:
+  capi:
+    image: node:20-alpine
+    working_dir: /app
+    volumes:
+      - ./app:/app
+    command: sh -c "npm install && node server.js"
+    environment:
+      PORT: 3000
+      ADMIN_PASSWORD: admin123
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
