@@ -60,9 +60,21 @@
           <label>Pixel ID<input name="pixel_id" /></label>
           <label>Access token<input name="access_token" /></label>
           <label>Test event code<input name="test_event_code" /></label>
-          <label><input type="checkbox" name="send_to_meta" /> Send to Meta</label>
-          <label><input type="checkbox" name="dry_run" checked /> Dry-run only</label>
-          <label><input type="checkbox" name="log_full_payloads" checked /> Log full payloads</label>
+          <label class="checkbox-row">
+            <input type="checkbox" name="send_to_meta" />
+            <span>Send to Meta</span>
+            <span class="info-icon" title="When enabled, events are forwarded to Meta Conversions API.">i</span>
+          </label>
+          <label class="checkbox-row">
+            <input type="checkbox" name="dry_run" checked />
+            <span>Dry-run only</span>
+            <span class="info-icon" title="Validate payloads without sending them to Meta.">i</span>
+          </label>
+          <label class="checkbox-row">
+            <input type="checkbox" name="log_full_payloads" checked />
+            <span>Log full payloads</span>
+            <span class="info-icon" title="Store full event bodies to help diagnose issues.">i</span>
+          </label>
           <div><label>&nbsp;</label><button type="submit">Create site</button></div>
         </form>
         <p class="helper">Endpoint: <code>POST /admin/sites</code></p>
