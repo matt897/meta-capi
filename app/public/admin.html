@@ -40,13 +40,14 @@
           <thead>
             <tr>
               <th>Name</th>
+              <th>Status</th>
               <th>Pixel ID</th>
               <th>Site Key</th>
             </tr>
           </thead>
           <tbody>
             <tr>
-              <td colspan="3" class="helper">No data loaded yet.</td>
+              <td colspan="4" class="helper">No data loaded yet.</td>
             </tr>
           </tbody>
         </table>
@@ -56,10 +57,11 @@
         <h2>Add a new site</h2>
         <form id="site-form" class="form-grid">
           <label>Name<input name="name" required /></label>
-          <label>Pixel ID<input name="pixel_id" required /></label>
-          <label>Access token<input name="access_token" required /></label>
+          <label>Pixel ID<input name="pixel_id" /></label>
+          <label>Access token<input name="access_token" /></label>
           <label>Test event code<input name="test_event_code" /></label>
-          <label><input type="checkbox" name="dry_run" /> Dry-run only</label>
+          <label><input type="checkbox" name="send_to_meta" /> Send to Meta</label>
+          <label><input type="checkbox" name="dry_run" checked /> Dry-run only</label>
           <label><input type="checkbox" name="log_full_payloads" checked /> Log full payloads</label>
           <div><label>&nbsp;</label><button type="submit">Create site</button></div>
         </form>
@@ -101,13 +103,14 @@ curl -X POST http://localhost:3000/admin/sites \
 
       function renderSites(sites) {
         if (!sites.length) {
-          sitesTableBody.innerHTML = '<tr><td colspan="3" class="helper">No sites configured.</td></tr>';
+          sitesTableBody.innerHTML = '<tr><td colspan="4" class="helper">No sites configured.</td></tr>';
           return;
         }
         sitesTableBody.innerHTML = sites
           .map(site => `
             <tr>
               <td>${site.name || "Untitled"}</td>
+              <td><span class="badge badge-${site.status || "unknown"}">${(site.status || "unknown").replace("_", " ")}</span></td>
               <td>${site.pixel_id || "—"}</td>
               <td><code>${site.site_key || "—"}</code></td>
             </tr>
@@ -135,6 +138,7 @@ curl -X POST http://localhost:3000/admin/sites \
         event.preventDefault();
         const formData = new FormData(siteForm);
         const payload = Object.fromEntries(formData.entries());
+        payload.send_to_meta = formData.get("send_to_meta") === "on";
         payload.dry_run = formData.get("dry_run") === "on";
         payload.log_full_payloads = formData.get("log_full_payloads") === "on";
 

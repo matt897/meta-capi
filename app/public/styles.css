@@ -159,9 +159,34 @@ td {
   color: #4ade80;
 }
 
+.pill-ready {
+  background: rgba(74, 222, 128, 0.2);
+  color: #4ade80;
+}
+
+.pill-dry_run {
+  background: rgba(248, 113, 113, 0.15);
+  color: #f97316;
+}
+
+.pill-not_configured {
+  background: rgba(148, 163, 184, 0.2);
+  color: #94a3b8;
+}
+
 .pill-deduped {
   background: rgba(56, 189, 248, 0.2);
   color: #38bdf8;
+}
+
+.pill-outbound_sent {
+  background: rgba(74, 222, 128, 0.2);
+  color: #4ade80;
+}
+
+.pill-outbound_skipped {
+  background: rgba(248, 113, 113, 0.2);
+  color: #f97316;
 }
 
 .pill-error {
@@ -207,12 +232,43 @@ td {
   border-left: 4px solid #4ade80;
 }
 
+.event-row.outbound_sent {
+  border-left: 4px solid #4ade80;
+}
+
+.event-row.outbound_skipped {
+  border-left: 4px solid #f97316;
+}
+
 .event-row.deduped {
   border-left: 4px solid #38bdf8;
 }
 
 .event-row.error {
   border-left: 4px solid #f87171;
+}
+
+.banner {
+  padding: 12px 16px;
+  border-radius: 12px;
+  margin-bottom: 16px;
+  font-weight: 600;
+}
+
+.banner.warning {
+  background: rgba(248, 113, 113, 0.2);
+  color: #f97316;
+}
+
+.banner.info {
+  background: rgba(56, 189, 248, 0.15);
+  color: #38bdf8;
+}
+
+.site-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .detail-header {
@@ -281,6 +337,10 @@ pre {
   display: flex;
   gap: 12px;
   flex-wrap: wrap;
+}
+
+.actions form {
+  margin: 0;
 }
 
 .copy-group button {
