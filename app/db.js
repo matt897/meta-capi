@@ -16,9 +16,11 @@ export async function initDb(dbPath) {
       pixel_id TEXT,
       access_token TEXT,
       test_event_code TEXT,
-      dry_run INTEGER DEFAULT 0,
+      send_to_meta INTEGER DEFAULT 0,
+      dry_run INTEGER DEFAULT 1,
       log_full_payloads INTEGER DEFAULT 1,
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
     CREATE TABLE IF NOT EXISTS events (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -55,6 +57,21 @@ export async function initDb(dbPath) {
     );
   `);
 
+  const columns = await db.all("PRAGMA table_info(sites)");
+  const columnNames = new Set(columns.map(column => column.name));
+
+  if (!columnNames.has("send_to_meta")) {
+    await db.exec("ALTER TABLE sites ADD COLUMN send_to_meta INTEGER DEFAULT 0");
+    await db.run(
+      "UPDATE sites SET send_to_meta = CASE WHEN dry_run = 1 THEN 0 ELSE 1 END WHERE send_to_meta IS NULL"
+    );
+  }
+
+  if (!columnNames.has("updated_at")) {
+    await db.exec("ALTER TABLE sites ADD COLUMN updated_at TEXT");
+    await db.run("UPDATE sites SET updated_at = created_at WHERE updated_at IS NULL");
+  }
+
   return db;
 }
 
@@ -84,13 +101,14 @@ export async function listSettings(db) {
 
 export async function createSite(db, site) {
   await db.run(
-    "INSERT INTO sites (site_id, site_key, name, pixel_id, access_token, test_event_code, dry_run, log_full_payloads) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    "INSERT INTO sites (site_id, site_key, name, pixel_id, access_token, test_event_code, send_to_meta, dry_run, log_full_payloads, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
     site.site_id,
     site.site_key,
     site.name,
     site.pixel_id,
     site.access_token,
     site.test_event_code,
+    site.send_to_meta ? 1 : 0,
     site.dry_run ? 1 : 0,
     site.log_full_payloads ? 1 : 0
   );
@@ -98,11 +116,12 @@ export async function createSite(db, site) {
 
 export async function updateSite(db, site) {
   await db.run(
-    "UPDATE sites SET name = ?, pixel_id = ?, access_token = ?, test_event_code = ?, dry_run = ?, log_full_payloads = ? WHERE site_id = ?",
+    "UPDATE sites SET name = ?, pixel_id = ?, access_token = ?, test_event_code = ?, send_to_meta = ?, dry_run = ?, log_full_payloads = ?, updated_at = CURRENT_TIMESTAMP WHERE site_id = ?",
     site.name,
     site.pixel_id,
     site.access_token,
     site.test_event_code,
+    site.send_to_meta ? 1 : 0,
     site.dry_run ? 1 : 0,
     site.log_full_payloads ? 1 : 0,
     site.site_id

@@ -12,11 +12,20 @@ Open `http://localhost:3000/` for the lightweight status page, or visit
 `http://localhost:3000/login` and sign in with the admin password (default `admin123` from
 `docker-compose.yml`).
 
+> **Security note:** If `ADMIN_PASSWORD` is not set, the gateway falls back to `admin123` and
+> shows a warning banner in the dashboard until you change it in **Settings**.
+
 ## Add a site
 
 1. Go to **Sites** → **Create site**.
-2. Enter your site name, Meta Pixel ID, access token, and optional test event code.
+2. Enter a site name. Credentials are optional until you’re ready to forward events.
 3. Copy the generated **Site Key** and use it in the `x-site-key` header when sending events.
+
+**Site status**
+
+- **Not Configured**: missing Pixel ID or access token.
+- **Dry Run**: credentials exist but send-to-Meta is off or dry-run mode is enabled.
+- **Ready**: Pixel ID + access token are set and send-to-Meta is enabled.
 
 ## Send a test event
 
@@ -39,8 +48,9 @@ curl -X POST http://localhost:3000/collect \
 ## Verify in Meta Test Events
 
 1. Add a **Test Event Code** on the site settings page.
-2. Send a test event as above.
-3. Visit Meta **Events Manager → Test Events** to confirm the event appears.
+2. Enable **Send to Meta** and disable dry-run mode.
+3. Use the **Send Test Event** button or send a test event as above.
+4. Visit Meta **Events Manager → Test Events** to confirm the event appears.
 
 ## Deduplication behavior
 
@@ -51,8 +61,8 @@ curl -X POST http://localhost:3000/collect \
 ## Dashboard highlights
 
 - **Dashboard**: status, 24h events/errors, dedup rate, and recent activity.
-- **Sites**: per-site cards with events/errors today, rotate site keys, and debug toggles.
-- **Live Events**: auto-refreshing stream with event details and payload tabs.
+- **Sites**: per-site cards with status chips, test event action, and credentials editor (masked by default).
+- **Live Events**: auto-refreshing stream with inbound/outbound status, skipped reasons, and payload tabs.
 - **Errors**: grouped by type with suggested resolutions.
 - **Settings**: runtime config (Meta API version, retries, dedup TTL, log retention, HMAC, rate limits).
 
@@ -66,3 +76,9 @@ admin page at `/admin` with supporting JSON endpoints (`/admin/sites`, `/admin/l
 
 - The SQLite database is persisted via the `meta-capi-data` volume defined in `docker-compose.yml`.
 - Settings are stored in SQLite and apply immediately without restarting the container.
+
+## Dry run & forwarding behavior
+
+- `/collect` always accepts inbound events for valid site keys and logs them.
+- If a site is **Not Configured** or **Dry Run**, events are logged as `outbound_skipped` and not forwarded.
+- If a site is **Ready** and send-to-Meta is enabled, events are forwarded to Meta and responses are logged.
