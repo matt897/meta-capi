@@ -35,6 +35,7 @@ export async function initDb(dbPath) {
       outbound_json TEXT,
       meta_status INTEGER,
       meta_body TEXT,
+      video_mode TEXT,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
     CREATE TABLE IF NOT EXISTS errors (
@@ -66,6 +67,7 @@ export async function initDb(dbPath) {
       page_url TEXT,
       selector TEXT DEFAULT 'video',
       enabled INTEGER DEFAULT 1,
+      mode TEXT NOT NULL DEFAULT 'test',
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
       UNIQUE(site_id, video_id)
@@ -102,6 +104,10 @@ export async function initDb(dbPath) {
     await db.exec("ALTER TABLE events ADD COLUMN event_source_url TEXT");
   }
 
+  if (!eventColumnNames.has("video_mode")) {
+    await db.exec("ALTER TABLE events ADD COLUMN video_mode TEXT");
+  }
+
   const videoColumns = await db.all("PRAGMA table_info(videos)");
   const videoColumnNames = new Set(videoColumns.map(column => column.name));
 
@@ -111,6 +117,11 @@ export async function initDb(dbPath) {
 
   if (videoColumns.length > 0 && !videoColumnNames.has("enabled")) {
     await db.exec("ALTER TABLE videos ADD COLUMN enabled INTEGER DEFAULT 1");
+  }
+
+  if (videoColumns.length > 0 && !videoColumnNames.has("mode")) {
+    await db.exec("ALTER TABLE videos ADD COLUMN mode TEXT NOT NULL DEFAULT 'test'");
+    await db.run("UPDATE videos SET mode = 'test' WHERE mode IS NULL");
   }
 
   if (videoColumns.length > 0 && !videoColumnNames.has("created_at")) {
@@ -200,7 +211,7 @@ export async function getSiteByKey(db, siteKey) {
 
 export async function insertEvent(db, event) {
   const result = await db.run(
-    "INSERT INTO events (site_id, event_id, event_name, video_id, percent, event_source_url, status, inbound_json, outbound_json, meta_status, meta_body) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    "INSERT INTO events (site_id, event_id, event_name, video_id, percent, event_source_url, status, inbound_json, outbound_json, meta_status, meta_body, video_mode) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     event.site_id,
     event.event_id ?? null,
     event.event_name ?? null,
@@ -211,7 +222,8 @@ export async function insertEvent(db, event) {
     event.inbound_json ?? null,
     event.outbound_json ?? null,
     event.meta_status ?? null,
-    event.meta_body ?? null
+    event.meta_body ?? null,
+    event.video_mode ?? null
   );
   return result.lastID;
 }
@@ -292,26 +304,28 @@ export async function getEventById(db, eventId) {
 
 export async function createVideo(db, video) {
   await db.run(
-    "INSERT INTO videos (id, site_id, video_id, name, page_url, selector, enabled, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+    "INSERT INTO videos (id, site_id, video_id, name, page_url, selector, enabled, mode, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
     video.id,
     video.site_id,
     video.video_id,
     video.name ?? null,
     video.page_url ?? null,
     video.selector ?? "video",
-    video.enabled ? 1 : 0
+    video.enabled ? 1 : 0,
+    video.mode ?? "test"
   );
 }
 
 export async function updateVideo(db, video) {
   await db.run(
-    "UPDATE videos SET site_id = ?, video_id = ?, name = ?, page_url = ?, selector = ?, enabled = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+    "UPDATE videos SET site_id = ?, video_id = ?, name = ?, page_url = ?, selector = ?, enabled = ?, mode = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
     video.site_id,
     video.video_id,
     video.name ?? null,
     video.page_url ?? null,
     video.selector ?? "video",
     video.enabled ? 1 : 0,
+    video.mode ?? "test",
     video.id
   );
 }
