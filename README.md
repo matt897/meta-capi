@@ -45,6 +45,15 @@ curl -X POST http://localhost:3000/collect \
   }'
 ```
 
+## Minimum user_data for Meta matching
+
+Meta requires customer info parameters for matching. The gateway now enforces a minimum of:
+
+- `user_data.client_ip_address`
+- `user_data.client_user_agent`
+
+Recommended extras include `_fbp`/`_fbc` cookies or hashed identifiers (`user_data.em`, `user_data.ph`, `user_data.external_id`). The `/collect` endpoint enriches missing IP/UA from request headers and will skip forwarding if they are still unavailable.
+
 ## Verify in Meta Test Events
 
 1. Add a **Test Event Code** on the site settings page.
