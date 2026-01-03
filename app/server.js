@@ -37,6 +37,7 @@ import {
 } from "./db.js";
 
 const app = express();
+app.set("trust proxy", true);
 app.use(
   express.json({
     limit: "1mb",
@@ -90,6 +91,9 @@ const rateLimitState = new Map();
 
 const TEST_EVENT_TYPES = ["PageView", "ViewContent", "Lead", "AddToCart", "Purchase"];
 const DEFAULT_TEST_EVENT_SOURCE_URL = "https://example.com/test";
+const DEFAULT_TEST_EVENT_IP = "1.1.1.1";
+const DEFAULT_TEST_EVENT_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
 
 async function getSettingValue(key, fallback = null) {
   const value = await getSetting(db, key);
@@ -248,13 +252,150 @@ function toNumber(value, fallback) {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function normalizeEmail(value) {
+  if (!value) return null;
+  const trimmed = String(value).trim().toLowerCase();
+  return trimmed.length ? trimmed : null;
+}
+
+function normalizePhone(value) {
+  if (!value) return null;
+  const digits = String(value).replace(/[^\d]/g, "");
+  return digits.length ? digits : null;
+}
+
+function normalizeExternalId(value) {
+  if (!value) return null;
+  const trimmed = String(value).trim();
+  return trimmed.length ? trimmed : null;
+}
+
+function sha256Hash(value) {
+  return crypto.createHash("sha256").update(value).digest("hex");
+}
+
+function buildHashedUserData(overrides = {}) {
+  const hashed = {};
+  if (!overrides.em) {
+    const normalizedEmail = normalizeEmail(overrides.email);
+    if (normalizedEmail) hashed.em = sha256Hash(normalizedEmail);
+  }
+  if (!overrides.ph) {
+    const normalizedPhone = normalizePhone(overrides.phone);
+    if (normalizedPhone) hashed.ph = sha256Hash(normalizedPhone);
+  }
+  const normalizedExternalId = normalizeExternalId(overrides.external_id);
+  if (normalizedExternalId) hashed.external_id = sha256Hash(normalizedExternalId);
+  return hashed;
+}
+
+function parseCookies(header) {
+  if (!header) return {};
+  return header.split(";").reduce((acc, part) => {
+    const trimmed = part.trim();
+    if (!trimmed) return acc;
+    const [key, ...rest] = trimmed.split("=");
+    if (!key) return acc;
+    acc[key] = decodeURIComponent(rest.join("=") || "");
+    return acc;
+  }, {});
+}
+
+function getForwardedFor(req) {
+  const header = req.headers["x-forwarded-for"];
+  if (Array.isArray(header)) {
+    return header[0]?.split(",")[0]?.trim() || null;
+  }
+  if (typeof header === "string") {
+    return header.split(",")[0]?.trim() || null;
+  }
+  return null;
+}
+
+function getClientIp(req) {
+  return getForwardedFor(req) || req.ip || null;
+}
+
+function enrichUserData(event, req) {
+  const existing = event.user_data && typeof event.user_data === "object" ? event.user_data : {};
+  const userData = { ...existing };
+  const userAgent = req.get("user-agent");
+  const clientIp = getClientIp(req);
+
+  if (!userData.client_user_agent && userAgent) {
+    userData.client_user_agent = userAgent;
+  }
+  if (!userData.client_ip_address && clientIp) {
+    userData.client_ip_address = clientIp;
+  }
+
+  const cookies = parseCookies(req.headers.cookie || "");
+  const fbp = userData.fbp || event.fbp || cookies._fbp;
+  const fbc = userData.fbc || event.fbc || cookies._fbc;
+
+  if (!userData.fbp && fbp) {
+    userData.fbp = fbp;
+  }
+  if (!userData.fbc && fbc) {
+    userData.fbc = fbc;
+  }
+
+  event.user_data = userData;
+  return userData;
+}
+
+function hasMinimumUserData(userData) {
+  return Boolean(userData?.client_ip_address && userData?.client_user_agent);
+}
+
+function maskHash(value) {
+  if (!value) return value;
+  const text = String(value);
+  if (text.length <= 10) return "••••";
+  return `${text.slice(0, 6)}…${text.slice(-4)}`;
+}
+
+function maskUserDataHashes(userData) {
+  if (!userData || typeof userData !== "object") return userData;
+  const maskValue = value => {
+    if (Array.isArray(value)) {
+      return value.map(item => maskHash(item));
+    }
+    return maskHash(value);
+  };
+  return {
+    ...userData,
+    em: userData.em ? maskValue(userData.em) : userData.em,
+    ph: userData.ph ? maskValue(userData.ph) : userData.ph,
+    external_id: userData.external_id ? maskValue(userData.external_id) : userData.external_id
+  };
+}
+
+function maskPayloadForDisplay(payload) {
+  if (!payload || typeof payload !== "object") return payload;
+  return {
+    ...payload,
+    user_data: maskUserDataHashes(payload.user_data)
+  };
+}
+
+function maskEventForDisplay(event) {
+  if (!event) return event;
+  return {
+    ...event,
+    inbound_json: maskPayloadForDisplay(event.inbound_json),
+    outbound_json: maskPayloadForDisplay(event.outbound_json)
+  };
+}
+
 function buildTestEvent(eventType, overrides = {}, context = {}) {
   const now = context.now ?? Math.floor(Date.now() / 1000);
   const eventSourceUrl = overrides.event_source_url || context.event_source_url || DEFAULT_TEST_EVENT_SOURCE_URL;
   const eventId = `${eventType}-${uuid()}`;
 
   const userData = {
-    client_user_agent: overrides.client_user_agent || "Meta-CAPI-Gateway-Test/1.0"
+    client_user_agent: overrides.client_user_agent || DEFAULT_TEST_EVENT_UA,
+    client_ip_address: overrides.client_ip_address || DEFAULT_TEST_EVENT_IP
   };
 
   if (overrides.user_data && typeof overrides.user_data === "object") {
@@ -401,7 +542,16 @@ function getErrorSuggestion(type) {
 }
 
 async function sendTestEvent({ site, eventType, overrides }) {
-  const event = buildTestEvent(eventType, overrides, {
+  const hashedOverrides = buildHashedUserData(overrides);
+  const preparedOverrides = {
+    ...overrides,
+    ...hashedOverrides
+  };
+  if (hashedOverrides.external_id) {
+    preparedOverrides.external_id = hashedOverrides.external_id;
+  }
+
+  const event = buildTestEvent(eventType, preparedOverrides, {
     now: Math.floor(Date.now() / 1000),
     event_source_url: DEFAULT_TEST_EVENT_SOURCE_URL
   });
@@ -984,6 +1134,7 @@ app.get("/dashboard/sites/:siteId", requireLogin, async (req, res) => {
     <div class="card" id="test-event">
       <h2>Send Test Event</h2>
       <p class="muted">Generate a Meta test event using this site's credentials. Test events always include the site's test event code.</p>
+      <p class="muted">Meta requires customer info parameters (IP/UA + identifiers) for matching.</p>
       <div id="test-event-warning" class="banner warning hidden"></div>
       <form id="test-event-form" class="form-grid"
         data-site-id="${site.site_id}"
@@ -997,7 +1148,28 @@ app.get("/dashboard/sites/:siteId", requireLogin, async (req, res) => {
           </select>
         </label>
         <label data-event-types="PageView,ViewContent,Lead,AddToCart,Purchase">Event Source URL
-          <input name="event_source_url" placeholder="${DEFAULT_TEST_EVENT_SOURCE_URL}" />
+          <input name="event_source_url" value="${DEFAULT_TEST_EVENT_SOURCE_URL}" />
+        </label>
+        <label data-event-types="PageView,ViewContent,Lead,AddToCart,Purchase">Client IP
+          <input name="client_ip_address" value="${DEFAULT_TEST_EVENT_IP}" />
+        </label>
+        <label data-event-types="PageView,ViewContent,Lead,AddToCart,Purchase">Client User Agent
+          <input name="client_user_agent" value="${DEFAULT_TEST_EVENT_UA}" />
+        </label>
+        <label data-event-types="PageView,ViewContent,Lead,AddToCart,Purchase">Email (optional)
+          <input name="email" placeholder="person@example.com" />
+        </label>
+        <label data-event-types="PageView,ViewContent,Lead,AddToCart,Purchase">Phone (optional)
+          <input name="phone" placeholder="+15551234567" />
+        </label>
+        <label data-event-types="PageView,ViewContent,Lead,AddToCart,Purchase">External ID (optional)
+          <input name="external_id" placeholder="customer-123" />
+        </label>
+        <label data-event-types="PageView,ViewContent,Lead,AddToCart,Purchase">FBP (optional)
+          <input name="fbp" placeholder="fb.1.1717000000.1234567890" />
+        </label>
+        <label data-event-types="PageView,ViewContent,Lead,AddToCart,Purchase">FBC (optional)
+          <input name="fbc" placeholder="fb.1.1717000000.AbCdEfGhIj" />
         </label>
         <label data-event-types="ViewContent,Lead,AddToCart,Purchase">Content Name
           <input name="content_name" placeholder="Test Content" />
@@ -1133,6 +1305,20 @@ app.get("/dashboard/sites/:siteId", requireLogin, async (req, res) => {
         const overrides = {};
         const eventSourceUrl = formData.get('event_source_url');
         if (eventSourceUrl) overrides.event_source_url = eventSourceUrl;
+        const clientIp = formData.get('client_ip_address');
+        if (clientIp) overrides.client_ip_address = clientIp;
+        const clientUserAgent = formData.get('client_user_agent');
+        if (clientUserAgent) overrides.client_user_agent = clientUserAgent;
+        const email = formData.get('email');
+        if (email) overrides.email = email;
+        const phone = formData.get('phone');
+        if (phone) overrides.phone = phone;
+        const externalId = formData.get('external_id');
+        if (externalId) overrides.external_id = externalId;
+        const fbp = formData.get('fbp');
+        if (fbp) overrides.fbp = fbp;
+        const fbc = formData.get('fbc');
+        if (fbc) overrides.fbc = fbc;
         const contentName = formData.get('content_name');
         if (contentName) overrides.content_name = contentName;
         const contentIds = formData.get('content_ids');
@@ -1432,24 +1618,25 @@ app.get("/dashboard/events/:eventId", requireLogin, async (req, res) => {
       body: `<div class="card"><h1>Event not found</h1></div>`
     }));
   }
+  const maskedEvent = maskEventForDisplay(event);
 
   const body = `
     <div class="card">
-      <h1>${event.event_name ?? "Event detail"}</h1>
-      <p class="muted">${event.site_name ?? "Unknown site"} · ${event.pixel_id ?? "No pixel"} · ${formatDate(event.created_at)}</p>
-      <p class="muted">Event ID: <code>${event.event_id ?? "—"}</code></p>
+      <h1>${maskedEvent.event_name ?? "Event detail"}</h1>
+      <p class="muted">${maskedEvent.site_name ?? "Unknown site"} · ${maskedEvent.pixel_id ?? "No pixel"} · ${formatDate(maskedEvent.created_at)}</p>
+      <p class="muted">Event ID: <code>${maskedEvent.event_id ?? "—"}</code></p>
     </div>
     <div class="card">
       <h2>Inbound payload</h2>
-      <pre>${JSON.stringify(event.inbound_json ?? {}, null, 2)}</pre>
+      <pre>${JSON.stringify(maskedEvent.inbound_json ?? {}, null, 2)}</pre>
     </div>
     <div class="card">
       <h2>Outbound payload</h2>
-      <pre>${JSON.stringify(event.outbound_json ?? {}, null, 2)}</pre>
+      <pre>${JSON.stringify(maskedEvent.outbound_json ?? {}, null, 2)}</pre>
     </div>
     <div class="card">
       <h2>Meta response</h2>
-      <pre>${JSON.stringify({ status: event.meta_status, body: event.meta_body }, null, 2)}</pre>
+      <pre>${JSON.stringify({ status: maskedEvent.meta_status, body: maskedEvent.meta_body }, null, 2)}</pre>
     </div>
   `;
 
@@ -1570,13 +1757,13 @@ app.get("/admin/events", requireLogin, async (req, res) => {
     status: req.query.status || undefined,
     eventName: req.query.event_name || undefined
   });
-  res.json(events);
+  res.json(events.map(event => maskEventForDisplay(event)));
 });
 
 app.get("/admin/events/:eventId", requireLogin, async (req, res) => {
   const event = await getEventById(db, req.params.eventId);
   if (!event) return res.status(404).json({ error: "not found" });
-  res.json(event);
+  res.json(maskEventForDisplay(event));
 });
 
 app.post("/collect", async (req, res) => {
@@ -1625,6 +1812,9 @@ app.post("/collect", async (req, res) => {
     await insertError(db, { type: "validation", site_id: site.site_id, message: "missing event_name or event_time" });
     return res.status(400).json({ error: "event_name and event_time are required" });
   }
+
+  const userData = enrichUserData(inboundEvent, req);
+  const minimumUserDataPresent = hasMinimumUserData(userData);
 
   let eventId = inboundEvent.event_id;
 
@@ -1714,6 +1904,27 @@ app.post("/collect", async (req, res) => {
     await cleanupRetention(db, await getSettingNumber("log_retention_hours", 168));
     await log({ type: "event", site_id: site.site_id, message: "dry run", event_db_id: eventDbId });
     return res.json({ ok: true, forwarded: false, reason: "dry_run" });
+  }
+
+  if (!minimumUserDataPresent) {
+    const eventDbId = await insertEvent(db, {
+      site_id: site.site_id,
+      event_id: eventId,
+      event_name: inboundEvent.event_name,
+      status: "outbound_skipped",
+      inbound_json: inboundLog,
+      outbound_json: outboundLog,
+      meta_status: 0,
+      meta_body: JSON.stringify({ reason: "insufficient_user_data" })
+    });
+    await cleanupRetention(db, await getSettingNumber("log_retention_hours", 168));
+    await log({
+      type: "event",
+      site_id: site.site_id,
+      message: "insufficient user data",
+      event_db_id: eventDbId
+    });
+    return res.json({ ok: true, forwarded: false, reason: "insufficient_user_data" });
   }
 
   try {
