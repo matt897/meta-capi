@@ -45,6 +45,30 @@ curl -X POST http://localhost:3000/collect \
   }'
 ```
 
+## Track HTML5 video milestones
+
+1. Go to **Videos** → **Add Video**.
+2. Select a site, paste the page URL, and optionally set a CSS selector (defaults to `video`).
+3. Save to generate a copy-paste snippet.
+4. Paste the snippet on the page containing the `<video>` element.
+
+The snippet loads a first-party SDK at `/sdk/video-tracker.js`. The SDK:
+
+- Fetches `/sdk/config` on load to confirm the video is enabled.
+- Tracks watched time (anti-scrub) and fires `Video25`, `Video50`, `Video75`, `Video95` milestones.
+- Sends events to `/v/track` with `video_id`, `percent`, and playback metrics.
+  - If a video is disabled or unknown, `/v/track` responds with `{ ok: false, reason: "video_disabled" }`.
+
+### Revocation
+
+Toggle **Enabled** off for a video in the dashboard to immediately stop tracking. The SDK checks
+`/sdk/config` on load and will stop sending events for disabled videos without any code changes.
+
+### Meta audiences
+
+Video events are forwarded as custom events (e.g., `Video25`) with `custom_data.video_id`. Use
+those fields in Meta **Events Manager → Custom Audiences** to build retargeting segments.
+
 ## Minimum user_data for Meta matching
 
 Meta requires customer info parameters for matching. The gateway now enforces a minimum of:
@@ -71,6 +95,7 @@ Recommended extras include `_fbp`/`_fbc` cookies or hashed identifiers (`user_da
 
 - **Dashboard**: status, 24h events/errors, dedup rate, and recent activity.
 - **Sites**: per-site cards with status chips, test event action, and credentials editor (masked by default).
+- **Videos**: register HTML5 videos, copy snippets, and revoke tracking instantly.
 - **Live Events**: auto-refreshing stream with inbound/outbound status, skipped reasons, and payload tabs.
 - **Errors**: grouped by type with suggested resolutions.
 - **Settings**: runtime config (Meta API version, retries, dedup TTL, log retention, HMAC, rate limits).

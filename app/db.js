@@ -27,6 +27,9 @@ export async function initDb(dbPath) {
       site_id TEXT,
       event_id TEXT,
       event_name TEXT,
+      video_id TEXT,
+      percent INTEGER,
+      event_source_url TEXT,
       status TEXT,
       inbound_json TEXT,
       outbound_json TEXT,
@@ -55,6 +58,18 @@ export async function initDb(dbPath) {
       event_id TEXT,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
+    CREATE TABLE IF NOT EXISTS videos (
+      id TEXT PRIMARY KEY,
+      site_id TEXT NOT NULL,
+      video_id TEXT NOT NULL,
+      name TEXT,
+      page_url TEXT,
+      selector TEXT DEFAULT 'video',
+      enabled INTEGER DEFAULT 1,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(site_id, video_id)
+    );
   `);
 
   const columns = await db.all("PRAGMA table_info(sites)");
@@ -70,6 +85,41 @@ export async function initDb(dbPath) {
   if (!columnNames.has("updated_at")) {
     await db.exec("ALTER TABLE sites ADD COLUMN updated_at TEXT");
     await db.run("UPDATE sites SET updated_at = created_at WHERE updated_at IS NULL");
+  }
+
+  const eventColumns = await db.all("PRAGMA table_info(events)");
+  const eventColumnNames = new Set(eventColumns.map(column => column.name));
+
+  if (!eventColumnNames.has("video_id")) {
+    await db.exec("ALTER TABLE events ADD COLUMN video_id TEXT");
+  }
+
+  if (!eventColumnNames.has("percent")) {
+    await db.exec("ALTER TABLE events ADD COLUMN percent INTEGER");
+  }
+
+  if (!eventColumnNames.has("event_source_url")) {
+    await db.exec("ALTER TABLE events ADD COLUMN event_source_url TEXT");
+  }
+
+  const videoColumns = await db.all("PRAGMA table_info(videos)");
+  const videoColumnNames = new Set(videoColumns.map(column => column.name));
+
+  if (videoColumns.length > 0 && !videoColumnNames.has("selector")) {
+    await db.exec("ALTER TABLE videos ADD COLUMN selector TEXT DEFAULT 'video'");
+  }
+
+  if (videoColumns.length > 0 && !videoColumnNames.has("enabled")) {
+    await db.exec("ALTER TABLE videos ADD COLUMN enabled INTEGER DEFAULT 1");
+  }
+
+  if (videoColumns.length > 0 && !videoColumnNames.has("created_at")) {
+    await db.exec("ALTER TABLE videos ADD COLUMN created_at TEXT DEFAULT CURRENT_TIMESTAMP");
+  }
+
+  if (videoColumns.length > 0 && !videoColumnNames.has("updated_at")) {
+    await db.exec("ALTER TABLE videos ADD COLUMN updated_at TEXT");
+    await db.run("UPDATE videos SET updated_at = created_at WHERE updated_at IS NULL");
   }
 
   return db;
@@ -150,10 +200,13 @@ export async function getSiteByKey(db, siteKey) {
 
 export async function insertEvent(db, event) {
   const result = await db.run(
-    "INSERT INTO events (site_id, event_id, event_name, status, inbound_json, outbound_json, meta_status, meta_body) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    "INSERT INTO events (site_id, event_id, event_name, video_id, percent, event_source_url, status, inbound_json, outbound_json, meta_status, meta_body) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     event.site_id,
     event.event_id ?? null,
     event.event_name ?? null,
+    event.video_id ?? null,
+    event.percent ?? null,
+    event.event_source_url ?? null,
     event.status,
     event.inbound_json ?? null,
     event.outbound_json ?? null,
@@ -174,7 +227,7 @@ export async function updateEventMeta(db, eventId, { status, outboundJson, metaS
   );
 }
 
-export async function listEvents(db, { limit = 50, siteId, status, eventName }) {
+export async function listEvents(db, { limit = 50, siteId, status, eventName, videoId }) {
   const conditions = [];
   const params = [];
 
@@ -189,6 +242,10 @@ export async function listEvents(db, { limit = 50, siteId, status, eventName }) 
   if (eventName) {
     conditions.push("events.event_name LIKE ?");
     params.push(`%${eventName}%`);
+  }
+  if (videoId) {
+    conditions.push("events.video_id = ?");
+    params.push(videoId);
   }
 
   const whereClause = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
@@ -231,6 +288,67 @@ export async function getEventById(db, eventId) {
     outbound_json: row.outbound_json ? JSON.parse(row.outbound_json) : null,
     meta_body: row.meta_body ? JSON.parse(row.meta_body) : null
   };
+}
+
+export async function createVideo(db, video) {
+  await db.run(
+    "INSERT INTO videos (id, site_id, video_id, name, page_url, selector, enabled, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+    video.id,
+    video.site_id,
+    video.video_id,
+    video.name ?? null,
+    video.page_url ?? null,
+    video.selector ?? "video",
+    video.enabled ? 1 : 0
+  );
+}
+
+export async function updateVideo(db, video) {
+  await db.run(
+    "UPDATE videos SET site_id = ?, video_id = ?, name = ?, page_url = ?, selector = ?, enabled = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+    video.site_id,
+    video.video_id,
+    video.name ?? null,
+    video.page_url ?? null,
+    video.selector ?? "video",
+    video.enabled ? 1 : 0,
+    video.id
+  );
+}
+
+export async function deleteVideo(db, videoId) {
+  await db.run("DELETE FROM videos WHERE id = ?", videoId);
+}
+
+export async function getVideoById(db, videoId) {
+  return db.get(
+    `
+      SELECT videos.*, sites.name AS site_name, sites.site_key AS site_key
+      FROM videos
+      LEFT JOIN sites ON videos.site_id = sites.site_id
+      WHERE videos.id = ?
+    `,
+    videoId
+  );
+}
+
+export async function getVideoBySiteAndVideoId(db, siteId, videoId) {
+  return db.get(
+    "SELECT * FROM videos WHERE site_id = ? AND video_id = ?",
+    siteId,
+    videoId
+  );
+}
+
+export async function listVideos(db) {
+  return db.all(
+    `
+      SELECT videos.*, sites.name AS site_name, sites.site_key AS site_key
+      FROM videos
+      LEFT JOIN sites ON videos.site_id = sites.site_id
+      ORDER BY videos.created_at DESC
+    `
+  );
 }
 
 export async function insertError(db, error) {
