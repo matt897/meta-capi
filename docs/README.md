@@ -2,14 +2,6 @@
 
 ## Setup
 
-1. Copy env example:
-
-```bash
-cp .env.example .env
-```
-
-2. Start the service:
-
 ```bash
 docker compose up --build
 ```
@@ -21,8 +13,9 @@ The app runs at `http://localhost:3000`.
 Visit `http://localhost:3000/login` and enter the admin password. From there you can:
 
 - Create and manage sites (site key, pixel ID, access token, test event code).
-- View the event console with polling logs.
-- Update global settings (HMAC, rate limit, log retention).
+- View the live event stream with payload detail tabs.
+- Review grouped errors and suggested resolutions.
+- Update global settings (Meta API version, retries, dedup TTL, log retention, HMAC, rate limits).
 
 ## Add a site
 
@@ -52,8 +45,8 @@ To confirm in Meta, provide the **test_event_code** in the site configuration an
 
 ## Deduplication
 
-- If you send an `event_id`, the gateway forwards it and stores it for 48 hours to suppress duplicates.
-- If you omit `event_id` **and** include `event_name`, `event_time`, plus at least one of `user_data.em`, `user_data.ph`, or `user_data.external_id`, the gateway generates a deterministic event ID from those values.
+- If you send an `event_id`, the gateway forwards it and stores it for the configured TTL (default 48 hours) to suppress duplicates.
+- If you omit `event_id` and include `event_name`, `event_time`, plus at least one of `user_data.em`, `user_data.ph`, or `user_data.external_id`, the gateway generates a deterministic event ID from those values.
 - If those inputs are missing, no event ID is generated and deduplication is skipped.
 
 ## Optional HMAC signature
@@ -73,12 +66,8 @@ curl -X POST http://localhost:3000/collect \
   -d "$payload"
 ```
 
-## Logs
-
-The event console shows structured JSON logs, including Meta response status/body.
-
 ## API endpoints
 
 - `POST /collect` – ingest events (requires `x-site-key`, optional `x-signature`).
-- `GET /admin/logs` – JSON logs (session auth).
-- `GET /admin/sites` – JSON site list (session auth).
+- `GET /admin/events` – JSON event list (session auth).
+- `GET /admin/events/:id` – JSON event detail (session auth).
