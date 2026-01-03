@@ -13,18 +13,23 @@ import {
   countEventsSince,
   countEventsTodayBySite,
   createSite,
+  createVideo,
   deleteSite,
+  deleteVideo,
   ensureSetting,
   getEventById,
   getSiteById,
   getSiteByKey,
   getSites,
+  getVideoById,
+  getVideoBySiteAndVideoId,
   initDb,
   insertError,
   insertEvent,
   listErrorGroups,
   listErrors,
   listEvents,
+  listVideos,
   listRecentErrors,
   listRecentEventsForError,
   listSettings,
@@ -32,6 +37,7 @@ import {
   setSetting,
   storeEventId,
   updateSite,
+  updateVideo,
   getSetting,
   hasRecentEventId
 } from "./db.js";
@@ -132,6 +138,7 @@ function renderPage({ title, body, nav = true }) {
     <nav class="nav">
       <a href="/dashboard">Dashboard</a>
       <a href="/dashboard/sites">Sites</a>
+      <a href="/dashboard/videos">Videos</a>
       <a href="/dashboard/live">Live Events</a>
       <a href="/dashboard/errors">Errors</a>
       <a href="/dashboard/settings">Settings</a>
@@ -191,6 +198,26 @@ function maskToken(token) {
   const trimmed = token.trim();
   if (trimmed.length <= 8) return "••••";
   return `${trimmed.slice(0, 4)}…${trimmed.slice(-4)}`;
+}
+
+function slugify(value) {
+  if (!value) return "";
+  return String(value)
+    .toLowerCase()
+    .replace(/https?:\/\//g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 64);
+}
+
+function buildVideoSnippet({ host, siteKey, videoId, selector }) {
+  const safeSelector = selector || "video";
+  return `<script
+  src="${host}/sdk/video-tracker.js"
+  data-site-key="${siteKey}"
+  data-video-id="${videoId}"
+  data-selector="${safeSelector}">
+</script>`;
 }
 
 function getSiteStatus(site) {
@@ -323,6 +350,11 @@ function resolveEventSourceUrl(event, req) {
   const origin = req.get("origin");
   if (origin) return origin;
   return null;
+}
+
+function deriveFbcFromFbclid(fbclid) {
+  if (!fbclid) return null;
+  return `fb.1.${Math.floor(Date.now() / 1000)}.${fbclid}`;
 }
 
 function enrichUserData(event, req) {
@@ -594,6 +626,7 @@ async function sendTestEvent({ site, eventType, overrides }) {
       site_id: site.site_id,
       event_id: event.event_id,
       event_name: event.event_name,
+      event_source_url: event.event_source_url,
       status: "test_event_skipped",
       inbound_json: inboundLog,
       outbound_json: outboundLog,
@@ -622,6 +655,7 @@ async function sendTestEvent({ site, eventType, overrides }) {
       site_id: site.site_id,
       event_id: event.event_id,
       event_name: event.event_name,
+      event_source_url: event.event_source_url,
       status: "test_event_skipped",
       inbound_json: inboundLog,
       outbound_json: outboundLog,
@@ -651,6 +685,7 @@ async function sendTestEvent({ site, eventType, overrides }) {
       site_id: site.site_id,
       event_id: event.event_id,
       event_name: event.event_name,
+      event_source_url: event.event_source_url,
       status: "test_event_skipped",
       inbound_json: inboundLog,
       outbound_json: outboundLog,
@@ -687,6 +722,7 @@ async function sendTestEvent({ site, eventType, overrides }) {
       site_id: site.site_id,
       event_id: event.event_id,
       event_name: event.event_name,
+      event_source_url: event.event_source_url,
       status: response.ok ? "test_event_sent" : "test_event_failed",
       inbound_json: inboundLog,
       outbound_json: outboundLog,
@@ -729,6 +765,7 @@ async function sendTestEvent({ site, eventType, overrides }) {
       site_id: site.site_id,
       event_id: event.event_id,
       event_name: event.event_name,
+      event_source_url: event.event_source_url,
       status: "test_event_error",
       inbound_json: inboundLog,
       outbound_json: outboundLog,
@@ -758,6 +795,167 @@ async function sendTestEvent({ site, eventType, overrides }) {
 }
 
 app.get("/health", (req, res) => res.json({ ok: true }));
+
+app.get("/sdk/config", async (req, res) => {
+  res.set("access-control-allow-origin", "*");
+  const siteKey = req.query.site_key;
+  const videoId = req.query.video_id;
+  if (!siteKey || !videoId) {
+    return res.json({ enabled: false });
+  }
+
+  const site = await getSiteByKey(db, siteKey);
+  if (!site) {
+    return res.json({ enabled: false });
+  }
+
+  const video = await getVideoBySiteAndVideoId(db, site.site_id, videoId);
+  if (!video || !video.enabled) {
+    return res.json({ enabled: false });
+  }
+
+  res.json({ enabled: true, milestones: [25, 50, 75, 95] });
+});
+
+app.get("/sdk/video-tracker.js", (req, res) => {
+  res.set("content-type", "application/javascript");
+  res.set("access-control-allow-origin", "*");
+  res.send(`
+    (function() {
+      function getCurrentScripts() {
+        return Array.from(document.querySelectorAll('script[data-site-key][data-video-id]'));
+      }
+
+      function getCookieValue(name) {
+        const match = document.cookie.match(new RegExp('(?:^|; )' + name.replace(/([.$?*|{}()\\[\\]\\\\/+^])/g, '\\\\$1') + '=([^;]*)'));
+        return match ? decodeURIComponent(match[1]) : '';
+      }
+
+      function getSessionId() {
+        const storageKey = 'metaCapiVideoSession';
+        try {
+          const existing = sessionStorage.getItem(storageKey);
+          if (existing) return existing;
+          const generated = (crypto && crypto.randomUUID) ? crypto.randomUUID() : Math.random().toString(36).slice(2);
+          sessionStorage.setItem(storageKey, generated);
+          return generated;
+        } catch (err) {
+          return Math.random().toString(36).slice(2);
+        }
+      }
+
+      async function sha256Hex(text) {
+        if (!crypto || !crypto.subtle) {
+          return text;
+        }
+        const data = new TextEncoder().encode(text);
+        const hash = await crypto.subtle.digest('SHA-256', data);
+        return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('');
+      }
+
+      async function setupTracker(script) {
+        const siteKey = script.dataset.siteKey;
+        const videoId = script.dataset.videoId;
+        const selector = script.dataset.selector || 'video';
+        if (!siteKey || !videoId) return;
+
+        const baseUrl = new URL(script.src, window.location.href).origin;
+        try {
+          const configRes = await fetch(baseUrl + '/sdk/config?site_key=' + encodeURIComponent(siteKey) + '&video_id=' + encodeURIComponent(videoId));
+          const config = await configRes.json();
+          if (!config || !config.enabled) return;
+
+          const milestones = (config.milestones || [25, 50, 75, 95]).slice().sort((a, b) => a - b);
+          const video = document.querySelector(selector);
+          if (!video) return;
+
+          const sessionId = getSessionId();
+          const fired = new Set();
+          let watchedSeconds = 0;
+          let lastTime = 0;
+
+          function getDuration() {
+            return Number.isFinite(video.duration) ? video.duration : 0;
+          }
+
+          function currentPercent() {
+            const duration = getDuration();
+            if (!duration) return 0;
+            return Math.floor((watchedSeconds / duration) * 100);
+          }
+
+          async function sendMilestone(percent) {
+            if (fired.has(percent)) return;
+            fired.add(percent);
+            const eventId = await sha256Hex(videoId + '|' + percent + '|' + sessionId);
+            const payload = {
+              video_id: videoId,
+              percent: percent,
+              event_id: eventId,
+              event_source_url: window.location.href,
+              watch_seconds: Math.round(watchedSeconds),
+              duration: Math.round(getDuration())
+            };
+            const fbp = getCookieValue('_fbp');
+            const fbc = getCookieValue('_fbc');
+            if (fbp) payload.fbp = fbp;
+            if (fbc) payload.fbc = fbc;
+            const fbclid = new URLSearchParams(window.location.search).get('fbclid');
+            if (fbclid) payload.fbclid = fbclid;
+
+            try {
+              await fetch(baseUrl + '/v/track', {
+                method: 'POST',
+                headers: {
+                  'content-type': 'application/json',
+                  'x-site-key': siteKey
+                },
+                body: JSON.stringify(payload),
+                keepalive: true
+              });
+            } catch (err) {
+              // fail silently
+            }
+          }
+
+          function checkMilestones() {
+            const percent = currentPercent();
+            milestones.forEach(milestone => {
+              if (percent >= milestone) {
+                sendMilestone(milestone);
+              }
+            });
+          }
+
+          video.addEventListener('timeupdate', () => {
+            if (video.paused || video.seeking) {
+              lastTime = video.currentTime;
+              return;
+            }
+            const delta = video.currentTime - lastTime;
+            if (delta > 0 && delta < 2) {
+              watchedSeconds += delta;
+            }
+            lastTime = video.currentTime;
+            checkMilestones();
+          });
+
+          video.addEventListener('ended', () => {
+            watchedSeconds = Math.max(watchedSeconds, getDuration());
+            checkMilestones();
+          });
+        } catch (err) {
+          // fail silently
+        }
+      }
+
+      const scripts = getCurrentScripts();
+      scripts.forEach(script => {
+        setupTracker(script);
+      });
+    })();
+  `);
+});
 
 app.get("/", (req, res) => {
   res.sendFile(path.join(process.cwd(), "public", "index.html"));
@@ -1471,6 +1669,321 @@ app.post("/dashboard/sites/:siteId/delete", requireLogin, async (req, res) => {
   res.redirect("/dashboard/sites");
 });
 
+app.get("/dashboard/videos", requireLogin, async (req, res) => {
+  const videos = await listVideos(db);
+  const host = `${req.protocol}://${req.get("host")}`;
+
+  const rows = videos.map(video => {
+    const snippet = buildVideoSnippet({
+      host,
+      siteKey: video.site_key,
+      videoId: video.video_id,
+      selector: video.selector
+    });
+    const encodedSnippet = encodeURIComponent(snippet);
+    return `
+      <tr>
+        <td>
+          <strong>${video.video_id}</strong><br />
+          <span class="muted">${video.name ?? "—"}</span>
+        </td>
+        <td>${video.site_name ?? "—"}</td>
+        <td>${video.page_url ?? "—"}</td>
+        <td>${video.enabled ? renderStatusPill("enabled") : renderStatusPill("disabled")}</td>
+        <td>
+          <div class="actions">
+            <a class="button secondary" href="/dashboard/videos/${video.id}">Edit</a>
+            <a class="button secondary" href="/dashboard/live?site=${video.site_id}&video_id=${video.video_id}">View Events</a>
+            <button class="button secondary copy-snippet" data-snippet="${encodedSnippet}">Copy Snippet</button>
+            <form method="post" action="/dashboard/videos/${video.id}/toggle">
+              <button type="submit" class="${video.enabled ? "danger" : ""}">${video.enabled ? "Disable" : "Enable"}</button>
+            </form>
+          </div>
+        </td>
+      </tr>
+    `;
+  });
+
+  const notice = req.query.notice ? `<div class="banner info">${req.query.notice}</div>` : "";
+
+  const body = `
+    <div class="card">
+      <h1>Videos</h1>
+      <p class="muted">Manage tracked videos, snippets, and revocation.</p>
+      <div class="actions">
+        <a class="button" href="/dashboard/videos/new">Add Video</a>
+      </div>
+    </div>
+    ${notice}
+    <div class="card">
+      <h2>Tracked videos</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Video</th>
+            <th>Site</th>
+            <th>Page URL</th>
+            <th>Status</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows.join("") || "<tr><td colspan=\"5\" class=\"muted\">No videos yet.</td></tr>"}
+        </tbody>
+      </table>
+    </div>
+    <script>
+      document.querySelectorAll('.copy-snippet').forEach(button => {
+        button.addEventListener('click', () => {
+          const snippet = decodeURIComponent(button.dataset.snippet || '');
+          navigator.clipboard.writeText(snippet);
+          button.textContent = 'Copied!';
+          setTimeout(() => { button.textContent = 'Copy Snippet'; }, 1500);
+        });
+      });
+    </script>
+  `;
+
+  res.send(renderPage({ title: "Videos", body }));
+});
+
+app.get("/dashboard/videos/new", requireLogin, async (req, res) => {
+  const sites = await getSites(db);
+  const siteOptions = sites
+    .map(site => `<option value="${site.site_id}">${site.name ?? site.site_id}</option>`)
+    .join("");
+
+  const body = `
+    <div class="card">
+      <h1>Add Video</h1>
+      <p class="muted">Register a video page and generate a snippet for tracking.</p>
+    </div>
+    <div class="card">
+      <form method="post" action="/dashboard/videos" class="form-grid">
+        <label>Site
+          <select name="site_id" required>
+            <option value="">Select a site</option>
+            ${siteOptions}
+          </select>
+        </label>
+        <label>Page URL
+          <input name="page_url" required placeholder="https://example.com/video-page" />
+        </label>
+        <label>Video name (optional)
+          <input name="name" placeholder="Homepage hero video" />
+        </label>
+        <label>Video ID slug
+          <input name="video_id" placeholder="homepage-hero" />
+          <span class="muted">Auto-generated from name or URL if blank.</span>
+        </label>
+        <label>CSS selector
+          <input name="selector" value="video" />
+        </label>
+        <label class="checkbox">
+          <input type="checkbox" name="enabled" checked />
+          Enabled
+        </label>
+        <button type="submit">Save video</button>
+      </form>
+    </div>
+  `;
+
+  res.send(renderPage({ title: "Add video", body }));
+});
+
+app.post("/dashboard/videos", requireLogin, async (req, res) => {
+  const site = await getSiteById(db, req.body.site_id);
+  if (!site) {
+    return res.status(400).send(renderPage({
+      title: "Invalid site",
+      body: `<div class="card"><h1>Invalid site</h1><p class="muted">Select a valid site.</p></div>`
+    }));
+  }
+
+  const rawSlug = req.body.video_id || req.body.name || req.body.page_url;
+  const videoSlug = slugify(rawSlug) || uuid();
+  const existing = await getVideoBySiteAndVideoId(db, site.site_id, videoSlug);
+
+  if (existing) {
+    return res.status(400).send(renderPage({
+      title: "Video ID exists",
+      body: `<div class="card"><h1>Video ID already exists</h1><p class="muted">Choose a different slug for this site.</p></div>`
+    }));
+  }
+
+  const id = uuid();
+  await createVideo(db, {
+    id,
+    site_id: site.site_id,
+    video_id: videoSlug,
+    name: req.body.name || null,
+    page_url: req.body.page_url || null,
+    selector: req.body.selector || "video",
+    enabled: req.body.enabled !== undefined
+  });
+  await log({ type: "admin", message: "video created", site_id: site.site_id, video_id: videoSlug });
+  res.redirect(`/dashboard/videos/${id}?notice=Video%20created`);
+});
+
+app.get("/dashboard/videos/:videoDbId", requireLogin, async (req, res) => {
+  const video = await getVideoById(db, req.params.videoDbId);
+  if (!video) {
+    return res.status(404).send(renderPage({
+      title: "Video not found",
+      body: `<div class="card"><h1>Video not found</h1></div>`
+    }));
+  }
+  const sites = await getSites(db);
+  const siteOptions = sites
+    .map(site => `<option value="${site.site_id}" ${site.site_id === video.site_id ? "selected" : ""}>${site.name ?? site.site_id}</option>`)
+    .join("");
+  const host = `${req.protocol}://${req.get("host")}`;
+  const snippet = buildVideoSnippet({
+    host,
+    siteKey: video.site_key,
+    videoId: video.video_id,
+    selector: video.selector
+  });
+  const notice = req.query.notice ? `<div class="banner info">${req.query.notice}</div>` : "";
+
+  const body = `
+    <div class="card">
+      <h1>Edit Video</h1>
+      <p class="muted">Update tracking settings or revoke tracking instantly.</p>
+    </div>
+    ${notice}
+    <div class="card">
+      <form method="post" action="/dashboard/videos/${video.id}" class="form-grid">
+        <label>Site
+          <select name="site_id" required>
+            ${siteOptions}
+          </select>
+        </label>
+        <label>Page URL
+          <input name="page_url" value="${video.page_url ?? ""}" required />
+        </label>
+        <label>Video name (optional)
+          <input name="name" value="${video.name ?? ""}" />
+        </label>
+        <label>Video ID slug
+          <input name="video_id" value="${video.video_id}" required />
+        </label>
+        <label>CSS selector
+          <input name="selector" value="${video.selector ?? "video"}" />
+        </label>
+        <label class="checkbox">
+          <input type="checkbox" name="enabled" ${video.enabled ? "checked" : ""} />
+          Enabled
+        </label>
+        <button type="submit">Save changes</button>
+      </form>
+    </div>
+    <div class="card">
+      <h2>Snippet</h2>
+      <p class="muted">Milestones sent: Video25/50/75/95. <code>video_id</code> is passed in <code>custom_data</code>.</p>
+      <pre>${snippet.replace(/</g, "&lt;")}</pre>
+      <button id="copy-snippet">Copy Snippet</button>
+    </div>
+    <div class="card">
+      <h2>Actions</h2>
+      <div class="actions">
+        <a class="button secondary" href="/dashboard/live?site=${video.site_id}&video_id=${video.video_id}">View Events</a>
+        <form method="post" action="/dashboard/videos/${video.id}/toggle">
+          <button type="submit" class="${video.enabled ? "danger" : ""}">${video.enabled ? "Disable" : "Enable"}</button>
+        </form>
+        <form method="post" action="/dashboard/videos/${video.id}/delete">
+          <button type="submit" class="danger">Delete</button>
+        </form>
+      </div>
+    </div>
+    <script>
+      const copyButton = document.getElementById('copy-snippet');
+      copyButton.addEventListener('click', () => {
+        navigator.clipboard.writeText(${JSON.stringify(snippet)});
+        copyButton.textContent = 'Copied!';
+        setTimeout(() => { copyButton.textContent = 'Copy Snippet'; }, 1500);
+      });
+    </script>
+  `;
+
+  res.send(renderPage({ title: "Edit video", body }));
+});
+
+app.post("/dashboard/videos/:videoDbId", requireLogin, async (req, res) => {
+  const video = await getVideoById(db, req.params.videoDbId);
+  if (!video) {
+    return res.status(404).send(renderPage({
+      title: "Video not found",
+      body: `<div class="card"><h1>Video not found</h1></div>`
+    }));
+  }
+
+  const site = await getSiteById(db, req.body.site_id);
+  if (!site) {
+    return res.status(400).send(renderPage({
+      title: "Invalid site",
+      body: `<div class="card"><h1>Invalid site</h1><p class="muted">Select a valid site.</p></div>`
+    }));
+  }
+
+  const videoSlug = slugify(req.body.video_id) || video.video_id;
+  const existing = await getVideoBySiteAndVideoId(db, site.site_id, videoSlug);
+  if (existing && existing.id !== video.id) {
+    return res.status(400).send(renderPage({
+      title: "Video ID exists",
+      body: `<div class="card"><h1>Video ID already exists</h1><p class="muted">Choose a different slug for this site.</p></div>`
+    }));
+  }
+
+  await updateVideo(db, {
+    id: video.id,
+    site_id: site.site_id,
+    video_id: videoSlug,
+    name: req.body.name || null,
+    page_url: req.body.page_url || null,
+    selector: req.body.selector || "video",
+    enabled: req.body.enabled !== undefined
+  });
+  await log({ type: "admin", message: "video updated", site_id: site.site_id, video_id: videoSlug });
+  res.redirect(`/dashboard/videos/${video.id}?notice=Video%20updated`);
+});
+
+app.post("/dashboard/videos/:videoDbId/toggle", requireLogin, async (req, res) => {
+  const video = await getVideoById(db, req.params.videoDbId);
+  if (!video) {
+    return res.status(404).send(renderPage({
+      title: "Video not found",
+      body: `<div class="card"><h1>Video not found</h1></div>`
+    }));
+  }
+  await updateVideo(db, {
+    id: video.id,
+    site_id: video.site_id,
+    video_id: video.video_id,
+    name: video.name,
+    page_url: video.page_url,
+    selector: video.selector,
+    enabled: !video.enabled
+  });
+  await log({
+    type: "admin",
+    message: "video toggled",
+    site_id: video.site_id,
+    video_id: video.video_id,
+    enabled: !video.enabled
+  });
+  res.redirect(req.get("referer") || "/dashboard/videos");
+});
+
+app.post("/dashboard/videos/:videoDbId/delete", requireLogin, async (req, res) => {
+  const video = await getVideoById(db, req.params.videoDbId);
+  if (video) {
+    await deleteVideo(db, video.id);
+    await log({ type: "admin", message: "video deleted", site_id: video.site_id, video_id: video.video_id });
+  }
+  res.redirect("/dashboard/videos?notice=Video%20deleted");
+});
+
 app.get("/dashboard/live", requireLogin, async (req, res) => {
   const sites = await getSites(db);
   const siteOptions = sites
@@ -1490,6 +2003,9 @@ app.get("/dashboard/live", requireLogin, async (req, res) => {
               <option value="">All sites</option>
               ${siteOptions}
             </select>
+          </label>
+          <label>Video ID
+            <input id="filter-video" placeholder="video-123" />
           </label>
           <label>Status
             <select id="filter-status">
@@ -1517,12 +2033,14 @@ app.get("/dashboard/live", requireLogin, async (req, res) => {
       const streamEl = document.getElementById('event-stream');
       const detailEl = document.getElementById('event-detail');
       const filterSite = document.getElementById('filter-site');
+      const filterVideo = document.getElementById('filter-video');
       const filterStatus = document.getElementById('filter-status');
       const filterName = document.getElementById('filter-name');
 
       function buildQuery() {
         const params = new URLSearchParams();
         if (filterSite.value) params.set('site', filterSite.value);
+        if (filterVideo.value) params.set('video_id', filterVideo.value);
         if (filterStatus.value) params.set('status', filterStatus.value);
         if (filterName.value) params.set('event_name', filterName.value);
         return params.toString();
@@ -1603,6 +2121,11 @@ app.get("/dashboard/live", requireLogin, async (req, res) => {
       }
 
       [filterSite, filterStatus].forEach(el => el.addEventListener('change', loadStream));
+      filterVideo.addEventListener('input', () => {
+        if (filterVideo.value.length === 0 || filterVideo.value.length > 2) {
+          loadStream();
+        }
+      });
       filterName.addEventListener('input', () => {
         if (filterName.value.length === 0 || filterName.value.length > 2) {
           loadStream();
@@ -1611,6 +2134,7 @@ app.get("/dashboard/live", requireLogin, async (req, res) => {
 
       const urlParams = new URLSearchParams(window.location.search);
       if (urlParams.get('site')) filterSite.value = urlParams.get('site');
+      if (urlParams.get('video_id')) filterVideo.value = urlParams.get('video_id');
 
       loadStream();
       setInterval(loadStream, 2000);
@@ -1634,6 +2158,7 @@ app.get("/dashboard/events/:eventId", requireLogin, async (req, res) => {
       <h1>${maskedEvent.event_name ?? "Event detail"}</h1>
       <p class="muted">${maskedEvent.site_name ?? "Unknown site"} · ${maskedEvent.pixel_id ?? "No pixel"} · ${formatDate(maskedEvent.created_at)}</p>
       <p class="muted">Event ID: <code>${maskedEvent.event_id ?? "—"}</code></p>
+      ${maskedEvent.video_id ? `<p class="muted">Video ID: <code>${maskedEvent.video_id}</code> · ${maskedEvent.percent ?? "—"}%</p>` : ""}
     </div>
     <div class="card">
       <h2>Inbound payload</h2>
@@ -1764,7 +2289,8 @@ app.get("/admin/events", requireLogin, async (req, res) => {
     limit: Number.isNaN(limit) ? 50 : limit,
     siteId: req.query.site || undefined,
     status: req.query.status || undefined,
-    eventName: req.query.event_name || undefined
+    eventName: req.query.event_name || undefined,
+    videoId: req.query.video_id || undefined
   });
   res.json(events.map(event => maskEventForDisplay(event)));
 });
@@ -1773,6 +2299,224 @@ app.get("/admin/events/:eventId", requireLogin, async (req, res) => {
   const event = await getEventById(db, req.params.eventId);
   if (!event) return res.status(404).json({ error: "not found" });
   res.json(maskEventForDisplay(event));
+});
+
+app.options("/v/track", (req, res) => {
+  res.set("access-control-allow-origin", "*");
+  res.set("access-control-allow-headers", "content-type,x-site-key");
+  res.set("access-control-allow-methods", "POST,OPTIONS");
+  res.status(204).send();
+});
+
+app.post("/v/track", async (req, res) => {
+  res.set("access-control-allow-origin", "*");
+  const siteKey = req.headers["x-site-key"] || req.body?.site_key;
+  const site = siteKey ? await getSiteByKey(db, siteKey) : null;
+
+  if (!site) {
+    await insertError(db, { type: "auth", message: "invalid site key" });
+    await log({ type: "auth", message: "invalid site key" });
+    return res.status(401).json({ ok: false, error: "invalid site key" });
+  }
+
+  const limitPerMinute = await getSettingNumber("rate_limit_per_min", 60);
+  if (!checkRateLimit(site.site_id, limitPerMinute)) {
+    await insertError(db, { type: "validation", site_id: site.site_id, message: "rate limit exceeded" });
+    await log({ type: "rate_limit", message: "rate limit exceeded", site_id: site.site_id });
+    return res.status(429).json({ ok: false, error: "rate limit exceeded" });
+  }
+
+  const { video_id, percent, event_id, event_source_url, watch_seconds, duration, fbp, fbc, fbclid } = req.body || {};
+  if (!video_id || percent === undefined || percent === null || !event_id) {
+    return res.status(400).json({ ok: false, error: "missing required fields" });
+  }
+
+  const video = await getVideoBySiteAndVideoId(db, site.site_id, video_id);
+  if (!video || !video.enabled) {
+    return res.json({ ok: false, reason: "video_disabled" });
+  }
+
+  const percentValue = Number.parseInt(percent, 10);
+  const eventName = Number.isFinite(percentValue) ? `Video${percentValue}` : "Video";
+  const resolvedSourceUrl = event_source_url || video.page_url || resolveEventSourceUrl({}, req) || "";
+  const userData = {
+    client_ip_address: getClientIp(req),
+    client_user_agent: req.get("user-agent")
+  };
+  if (fbp) userData.fbp = fbp;
+  if (fbc) {
+    userData.fbc = fbc;
+  } else if (fbclid) {
+    userData.fbc = deriveFbcFromFbclid(fbclid);
+  }
+
+  const inboundEvent = {
+    event_name: eventName,
+    event_time: Math.floor(Date.now() / 1000),
+    event_id,
+    action_source: "website",
+    event_source_url: resolvedSourceUrl,
+    user_data: userData,
+    custom_data: {
+      video_id,
+      percent: percentValue,
+      watch_seconds,
+      duration,
+      page_url: video.page_url
+    }
+  };
+
+  const dedupTtlHours = await getSettingNumber("dedup_ttl_hours", 48);
+  const seen = await hasRecentEventId(db, site.site_id, event_id, dedupTtlHours);
+  if (seen) {
+    await insertEvent(db, {
+      site_id: site.site_id,
+      event_id,
+      event_name: inboundEvent.event_name,
+      video_id,
+      percent: percentValue,
+      event_source_url: resolvedSourceUrl,
+      status: "deduped",
+      inbound_json: JSON.stringify(sanitizePayload(inboundEvent, site.log_full_payloads === 1))
+    });
+    await log({
+      type: "dedup",
+      message: "duplicate video event suppressed",
+      site_id: site.site_id,
+      meta: { event_id, event_name: inboundEvent.event_name }
+    });
+    return res.json({ ok: true, deduped: true });
+  }
+  await storeEventId(db, site.site_id, event_id, dedupTtlHours);
+
+  const payload = { data: [inboundEvent] };
+  const outboundLog = JSON.stringify({
+    ...payload,
+    data: [sanitizePayload(inboundEvent, site.log_full_payloads === 1)]
+  });
+  const inboundLog = JSON.stringify(sanitizePayload(inboundEvent, site.log_full_payloads === 1));
+
+  if (!site.pixel_id || !site.access_token) {
+    await insertEvent(db, {
+      site_id: site.site_id,
+      event_id,
+      event_name: inboundEvent.event_name,
+      video_id,
+      percent: percentValue,
+      event_source_url: resolvedSourceUrl,
+      status: "outbound_skipped",
+      inbound_json: inboundLog,
+      outbound_json: outboundLog,
+      meta_status: 0,
+      meta_body: JSON.stringify({ reason: "missing_credentials" })
+    });
+    await cleanupRetention(db, await getSettingNumber("log_retention_hours", 168));
+    return res.json({ ok: true, forwarded: false, reason: "missing_credentials" });
+  }
+
+  if (!site.send_to_meta || site.dry_run) {
+    const reason = site.dry_run ? "dry_run" : "send_to_meta_off";
+    await insertEvent(db, {
+      site_id: site.site_id,
+      event_id,
+      event_name: inboundEvent.event_name,
+      video_id,
+      percent: percentValue,
+      event_source_url: resolvedSourceUrl,
+      status: "outbound_skipped",
+      inbound_json: inboundLog,
+      outbound_json: outboundLog,
+      meta_status: 0,
+      meta_body: JSON.stringify({ reason })
+    });
+    await cleanupRetention(db, await getSettingNumber("log_retention_hours", 168));
+    return res.json({ ok: true, forwarded: false, reason });
+  }
+
+  if (!hasMinimumUserData(userData)) {
+    await insertEvent(db, {
+      site_id: site.site_id,
+      event_id,
+      event_name: inboundEvent.event_name,
+      video_id,
+      percent: percentValue,
+      event_source_url: resolvedSourceUrl,
+      status: "outbound_skipped",
+      inbound_json: inboundLog,
+      outbound_json: outboundLog,
+      meta_status: 0,
+      meta_body: JSON.stringify({ reason: "insufficient_user_data" })
+    });
+    await cleanupRetention(db, await getSettingNumber("log_retention_hours", 168));
+    return res.json({ ok: true, forwarded: false, reason: "insufficient_user_data" });
+  }
+
+  const apiVersion = await getSettingValue("default_meta_api_version", "v24.0");
+  const url = `https://graph.facebook.com/${apiVersion}/${site.pixel_id}/events?access_token=${site.access_token}`;
+
+  try {
+    const retryCount = await getSettingNumber("retry_count", 1);
+    const { response, body } = await sendToMeta({ url, payload, retryCount });
+    const status = response.status;
+
+    await insertEvent(db, {
+      site_id: site.site_id,
+      event_id,
+      event_name: inboundEvent.event_name,
+      video_id,
+      percent: percentValue,
+      event_source_url: resolvedSourceUrl,
+      status: "outbound_sent",
+      inbound_json: inboundLog,
+      outbound_json: outboundLog,
+      meta_status: status,
+      meta_body: JSON.stringify(body)
+    });
+
+    if (!response.ok) {
+      const errorType = status >= 500 ? "meta_5xx" : "meta_4xx";
+      await insertError(db, {
+        type: errorType,
+        site_id: site.site_id,
+        event_id,
+        message: "Meta API error",
+        meta_status: status,
+        meta_body: JSON.stringify(body)
+      });
+    }
+
+    await cleanupRetention(db, await getSettingNumber("log_retention_hours", 168));
+    res.status(response.ok ? 200 : status).json({
+      ok: response.ok,
+      forwarded: true,
+      meta_status: status,
+      meta_response: body
+    });
+  } catch (err) {
+    await insertEvent(db, {
+      site_id: site.site_id,
+      event_id,
+      event_name: inboundEvent.event_name,
+      video_id,
+      percent: percentValue,
+      event_source_url: resolvedSourceUrl,
+      status: "error",
+      inbound_json: inboundLog,
+      outbound_json: outboundLog,
+      meta_status: null,
+      meta_body: JSON.stringify({ error: err.toString() })
+    });
+
+    await insertError(db, {
+      type: "network",
+      site_id: site.site_id,
+      event_id,
+      message: err.toString()
+    });
+
+    await cleanupRetention(db, await getSettingNumber("log_retention_hours", 168));
+    res.status(500).json({ ok: false, error: "failed to send to meta" });
+  }
 });
 
 app.post("/collect", async (req, res) => {
@@ -1867,6 +2611,7 @@ app.post("/collect", async (req, res) => {
         site_id: site.site_id,
         event_id: eventId,
         event_name: inboundEvent.event_name,
+        event_source_url: inboundEvent.event_source_url,
         status: "deduped",
         inbound_json: JSON.stringify(sanitizePayload(inboundEvent, site.log_full_payloads === 1))
       });
@@ -1900,6 +2645,7 @@ app.post("/collect", async (req, res) => {
       site_id: site.site_id,
       event_id: eventId,
       event_name: inboundEvent.event_name,
+      event_source_url: inboundEvent.event_source_url,
       status: "outbound_skipped",
       inbound_json: inboundLog,
       outbound_json: outboundLog,
@@ -1916,6 +2662,7 @@ app.post("/collect", async (req, res) => {
       site_id: site.site_id,
       event_id: eventId,
       event_name: inboundEvent.event_name,
+      event_source_url: inboundEvent.event_source_url,
       status: "outbound_skipped",
       inbound_json: inboundLog,
       outbound_json: outboundLog,
@@ -1932,6 +2679,7 @@ app.post("/collect", async (req, res) => {
       site_id: site.site_id,
       event_id: eventId,
       event_name: inboundEvent.event_name,
+      event_source_url: inboundEvent.event_source_url,
       status: "outbound_skipped",
       inbound_json: inboundLog,
       outbound_json: outboundLog,
@@ -1957,6 +2705,7 @@ app.post("/collect", async (req, res) => {
       site_id: site.site_id,
       event_id: eventId,
       event_name: inboundEvent.event_name,
+      event_source_url: inboundEvent.event_source_url,
       status: "outbound_sent",
       inbound_json: inboundLog,
       outbound_json: outboundLog,
@@ -1992,6 +2741,7 @@ app.post("/collect", async (req, res) => {
       site_id: site.site_id,
       event_id: eventId,
       event_name: inboundEvent.event_name,
+      event_source_url: inboundEvent.event_source_url,
       status: "error",
       inbound_json: inboundLog,
       outbound_json: outboundLog,
