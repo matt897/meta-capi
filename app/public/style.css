@@ -12,8 +12,9 @@ main { max-width: 900px; margin: 0 auto; }
 .helper { color: #64748b; font-size: 13px; }
 pre { background: #0f172a; color: #e2e8f0; padding: 12px; border-radius: 8px; overflow-x: auto; }
 code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
-label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 6px; }
+label { display: flex; flex-direction: column; gap: 6px; font-size: 13px; font-weight: 600; margin-bottom: 6px; }
 input, button { font: inherit; padding: 8px 10px; border-radius: 8px; border: 1px solid #cbd5f5; width: 100%; box-sizing: border-box; }
+input[type="checkbox"] { width: auto; }
 button { background: #2563eb; color: #fff; border: none; cursor: pointer; font-weight: 600; }
 button.secondary { background: #0f172a; }
 .table { width: 100%; border-collapse: collapse; font-size: 13px; }
@@ -22,3 +23,17 @@ button.secondary { background: #0f172a; }
 .form-grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
 .section-title { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
 .footer { margin-top: 20px; color: #64748b; font-size: 12px; }
+.checkbox-row { flex-direction: row; align-items: center; gap: 8px; margin-bottom: 0; }
+.info-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 999px;
+  border: 1px solid #cbd5f5;
+  background: #eff6ff;
+  color: #1d4ed8;
+  font-size: 11px;
+  font-weight: 700;
+}
