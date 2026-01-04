@@ -83,6 +83,7 @@ const SESSION_SECRET = process.env.SESSION_SECRET || "meta-capi-session";
 const DB_PATH = process.env.DB_PATH || "./data/meta-capi.sqlite";
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL?.replace(/\/+$/, "") || null;
 const APP_ENCRYPTION_KEY = process.env.APP_ENCRYPTION_KEY || "";
+const DEFAULT_TIME_ZONE = process.env.DEFAULT_TIME_ZONE || "UTC";
 const CORS_ALLOWED_ORIGINS = (process.env.CORS_ALLOWED_ORIGINS || "https://mattmakesmoney.com")
   .split(",")
   .map(origin => origin.trim())
@@ -102,6 +103,21 @@ await ensureSetting(db, "log_retention_hours", "168");
 await ensureSetting(db, "hmac_required", process.env.HMAC_REQUIRED || "false");
 await ensureSetting(db, "hmac_secret", process.env.HMAC_SECRET || "");
 await ensureSetting(db, "rate_limit_per_min", process.env.RATE_LIMIT_PER_MIN || "60");
+await ensureSetting(db, "time_zone", DEFAULT_TIME_ZONE);
+
+function normalizeTimeZone(value) {
+  if (!value) return null;
+  const trimmed = String(value).trim();
+  if (!trimmed) return null;
+  try {
+    Intl.DateTimeFormat("en-US", { timeZone: trimmed }).format(new Date());
+    return trimmed;
+  } catch {
+    return null;
+  }
+}
+
+let cachedTimeZone = normalizeTimeZone(await getSetting(db, "time_zone")) || DEFAULT_TIME_ZONE;
 
 if ((await countUsers(db)) === 0) {
   const passwordHash = await bcrypt.hash(DEFAULT_ADMIN_PASSWORD, 12);
@@ -310,7 +326,11 @@ function requireAuth(req, res, next) {
 function formatDate(value) {
   if (!value) return "—";
   const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+  if (Number.isNaN(date.getTime())) return value;
+  if (cachedTimeZone) {
+    return date.toLocaleString("en-US", { timeZone: cachedTimeZone });
+  }
+  return date.toLocaleString();
 }
 
 function renderStatusPill(status) {
@@ -2712,6 +2732,7 @@ app.get("/dashboard/live", requireAuth, async (req, res) => {
       </section>
     </div>
     <script>
+      const timeZone = ${JSON.stringify(cachedTimeZone)};
       const streamEl = document.getElementById('event-stream');
       const detailEl = document.getElementById('event-detail');
       const filterSite = document.getElementById('filter-site');
@@ -2728,6 +2749,22 @@ app.get("/dashboard/live", requireAuth, async (req, res) => {
         return params.toString();
       }
 
+      function formatEventTime(value) {
+        const date = new Date(value);
+        if (timeZone) {
+          return date.toLocaleTimeString('en-US', { timeZone });
+        }
+        return date.toLocaleTimeString();
+      }
+
+      function formatEventDate(value) {
+        const date = new Date(value);
+        if (timeZone) {
+          return date.toLocaleString('en-US', { timeZone });
+        }
+        return date.toLocaleString();
+      }
+
       function renderRow(event) {
         const row = document.createElement('div');
         row.className = 'event-row ' + event.status;
@@ -2737,7 +2774,7 @@ app.get("/dashboard/live", requireAuth, async (req, res) => {
             '<strong>' + (event.event_name || '—') + '</strong>' +
             '<div class="muted">' + (event.site_name || 'Unknown site') + '</div>' +
           '</div>' +
-          '<div class="muted">' + new Date(event.created_at).toLocaleTimeString() + '</div>' +
+          '<div class="muted">' + formatEventTime(event.created_at) + '</div>' +
           '<div>' + (event.status || '').replace('_', ' ') + '</div>';
         row.addEventListener('click', () => loadDetail(event.id));
         return row;
@@ -2768,7 +2805,7 @@ app.get("/dashboard/live", requireAuth, async (req, res) => {
           '<div class="detail-header">' +
             '<div>' +
               '<h2>' + (event.event_name || 'Event detail') + '</h2>' +
-              '<p class="muted">' + (event.site_name || 'Unknown site') + ' · ' + (event.pixel_id || 'No pixel') + ' · ' + new Date(event.created_at).toLocaleString() + '</p>' +
+              '<p class="muted">' + (event.site_name || 'Unknown site') + ' · ' + (event.pixel_id || 'No pixel') + ' · ' + formatEventDate(event.created_at) + '</p>' +
               videoModeLine +
             '</div>' +
             '<div class="copy-group">' +
@@ -2962,6 +2999,10 @@ app.get("/admin/settings", requireAuth, async (req, res) => {
         <label>Log retention (hours)
           <input name="log_retention_hours" value="${settings.log_retention_hours ?? "168"}" />
         </label>
+        <label>Time zone
+          <input name="time_zone" value="${settings.time_zone ?? DEFAULT_TIME_ZONE}" />
+          <span class="muted">Use an IANA time zone like America/New_York.</span>
+        </label>
         <label>Rate limit per minute
           <input name="rate_limit_per_min" value="${settings.rate_limit_per_min ?? "60"}" />
         </label>
@@ -2983,6 +3024,9 @@ app.post("/admin/settings", requireAuth, async (req, res) => {
   await setSetting(db, "retry_count", req.body.retry_count || "1");
   await setSetting(db, "dedup_ttl_hours", req.body.dedup_ttl_hours || "48");
   await setSetting(db, "log_retention_hours", req.body.log_retention_hours || "168");
+  const normalizedTimeZone = normalizeTimeZone(req.body.time_zone) || DEFAULT_TIME_ZONE;
+  await setSetting(db, "time_zone", normalizedTimeZone);
+  cachedTimeZone = normalizedTimeZone;
   await setSetting(db, "rate_limit_per_min", req.body.rate_limit_per_min || "60");
   await setSetting(db, "hmac_required", req.body.hmac_required || "false");
   await setSetting(db, "hmac_secret", req.body.hmac_secret || "");
