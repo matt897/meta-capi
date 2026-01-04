@@ -33,6 +33,7 @@ import {
   initDb,
   insertError,
   insertEvent,
+  insertOutboundLog,
   listErrorGroups,
   listErrors,
   listEvents,
@@ -40,6 +41,7 @@ import {
   listRecentErrors,
   listRecentEventsForError,
   listSettings,
+  markInboundDuplicate,
   rotateSiteKey,
   setSetting,
   updateUserPassword,
@@ -47,7 +49,8 @@ import {
   updateSite,
   updateVideo,
   getSetting,
-  hasRecentEventId
+  hasRecentEventId,
+  updateInboundOutbound
 } from "./db.js";
 
 const app = express();
@@ -336,6 +339,14 @@ function formatDate(value) {
 function renderStatusPill(status) {
   const normalized = status || "unknown";
   return `<span class="pill pill-${normalized}">${normalized.replace("_", " ")}</span>`;
+}
+
+function resolveOutboundStatus(result) {
+  if (!result) return null;
+  if (result === "sent") return "outbound_sent";
+  if (result === "skipped") return "outbound_skipped";
+  if (result === "failed") return "outbound_failed";
+  return result;
 }
 
 function maskToken(token) {
@@ -707,7 +718,9 @@ function maskEventForDisplay(event) {
   return {
     ...event,
     inbound_json: maskPayloadForDisplay(event.inbound_json),
-    outbound_json: maskPayloadForDisplay(event.outbound_json)
+    outbound_json: maskPayloadForDisplay(event.outbound_json),
+    outbound_request_json: maskPayloadForDisplay(event.outbound_request_json),
+    outbound_response_json: event.outbound_response_json
   };
 }
 
@@ -1563,7 +1576,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
   const recentEvents = await listEvents(db, { limit: 10 });
   const sites = await getSites(db);
   const skippedCount = await db.get(
-    "SELECT COUNT(*) as count FROM events WHERE status = 'outbound_skipped' AND created_at > datetime('now', '-24 hours')"
+    "SELECT COUNT(*) as count FROM events WHERE outbound_result = 'skipped' AND created_at > datetime('now', '-24 hours')"
   );
   const banners = [];
   if (req.session.mustChangePassword) {
@@ -1621,7 +1634,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
               <td>${event.site_name ?? "—"}</td>
               <td><a href="/dashboard/events/${event.id}">${event.event_name ?? "—"}</a></td>
               <td>${event.pixel_id ?? "—"}</td>
-              <td>${renderStatusPill(event.status)}</td>
+              <td>${renderStatusPill(resolveOutboundStatus(event.outbound_result) || event.status)}</td>
             </tr>
           `
             )
@@ -1637,7 +1650,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
 app.get("/dashboard/sites", requireAuth, async (req, res) => {
   const sites = await getSites(db);
   const skippedCount = await db.get(
-    "SELECT COUNT(*) as count FROM events WHERE status = 'outbound_skipped' AND created_at > datetime('now', '-24 hours')"
+    "SELECT COUNT(*) as count FROM events WHERE outbound_result = 'skipped' AND created_at > datetime('now', '-24 hours')"
   );
   const banners = [];
   if (req.session.mustChangePassword) {
@@ -2706,6 +2719,12 @@ app.get("/dashboard/live", requireAuth, async (req, res) => {
               ${siteOptions}
             </select>
           </label>
+          <label>Event type
+            <select id="filter-type">
+              <option value="">All</option>
+              <option value="video_milestone">Video milestone</option>
+            </select>
+          </label>
           <label>Video ID
             <input id="filter-video" placeholder="video-123" />
           </label>
@@ -2714,8 +2733,9 @@ app.get("/dashboard/live", requireAuth, async (req, res) => {
               <option value="">All</option>
               <option value="outbound_sent">Outbound sent</option>
               <option value="outbound_skipped">Outbound skipped</option>
+              <option value="outbound_failed">Outbound failed</option>
+              <option value="duplicate">Duplicate</option>
               <option value="deduped">Deduped</option>
-              <option value="error">Error</option>
             </select>
           </label>
           <label>Event name
@@ -2736,6 +2756,7 @@ app.get("/dashboard/live", requireAuth, async (req, res) => {
       const streamEl = document.getElementById('event-stream');
       const detailEl = document.getElementById('event-detail');
       const filterSite = document.getElementById('filter-site');
+      const filterType = document.getElementById('filter-type');
       const filterVideo = document.getElementById('filter-video');
       const filterStatus = document.getElementById('filter-status');
       const filterName = document.getElementById('filter-name');
@@ -2743,6 +2764,7 @@ app.get("/dashboard/live", requireAuth, async (req, res) => {
       function buildQuery() {
         const params = new URLSearchParams();
         if (filterSite.value) params.set('site', filterSite.value);
+        if (filterType.value) params.set('event_type', filterType.value);
         if (filterVideo.value) params.set('video_id', filterVideo.value);
         if (filterStatus.value) params.set('status', filterStatus.value);
         if (filterName.value) params.set('event_name', filterName.value);
@@ -2767,15 +2789,43 @@ app.get("/dashboard/live", requireAuth, async (req, res) => {
 
       function renderRow(event) {
         const row = document.createElement('div');
-        row.className = 'event-row ' + event.status;
+        const outboundStatus = event.outbound_result ? 'outbound_' + event.outbound_result : (event.status || '');
+        row.className = 'event-row ' + outboundStatus;
         row.dataset.id = event.id;
+        const inboundBits = [];
+        if (event.video_id) {
+          inboundBits.push('Video ' + event.video_id);
+        }
+        if (event.percent !== null && event.percent !== undefined) {
+          inboundBits.push(event.percent + '%');
+        }
+        const inboundLine = inboundBits.length ? '<div class="muted">' + inboundBits.join(' · ') + '</div>' : '';
+        const sourceLine = event.event_source_url
+          ? '<div class="muted truncate" title="' + event.event_source_url + '">' + event.event_source_url + '</div>'
+          : '';
+        const duplicateLine = event.duplicate_count > 0
+          ? '<div><span class="pill pill-duplicate" title="Duplicate received">Duplicate x' + event.duplicate_count + '</span></div>'
+          : '';
+        const outboundLabel = event.outbound_result
+          ? event.outbound_result
+          : (event.status || 'received');
+        const isOutboundStatus = ['sent', 'skipped', 'failed'].includes(outboundLabel) || outboundLabel.startsWith('outbound_');
+        const outboundClass = isOutboundStatus
+          ? (outboundLabel.startsWith('outbound_') ? outboundLabel : 'outbound_' + outboundLabel)
+          : outboundLabel;
+        const outboundDisplay = outboundLabel.replace('outbound_', '').replace('_', ' ');
+        const outboundReason = event.outbound_reason ? ' title="' + event.outbound_reason + '"' : '';
+        const outboundBadge = '<span class="pill pill-' + outboundClass + '"' + outboundReason + '>' + outboundDisplay + '</span>';
         row.innerHTML =
           '<div>' +
             '<strong>' + (event.event_name || '—') + '</strong>' +
             '<div class="muted">' + (event.site_name || 'Unknown site') + '</div>' +
+            inboundLine +
+            sourceLine +
+            duplicateLine +
           '</div>' +
-          '<div class="muted">' + formatEventTime(event.created_at) + '</div>' +
-          '<div>' + (event.status || '').replace('_', ' ') + '</div>';
+          '<div class="muted">' + formatEventTime(event.received_at || event.created_at) + '</div>' +
+          '<div>' + outboundBadge + '</div>';
         row.addEventListener('click', () => loadDetail(event.id));
         return row;
       }
@@ -2799,18 +2849,40 @@ app.get("/dashboard/live", requireAuth, async (req, res) => {
         const response = await fetch('/admin/events/' + eventId);
         const event = await response.json();
         if (!event || !event.id) return;
-        const outboundReason = event.meta_body && event.meta_body.reason ? event.meta_body.reason : null;
+        const outboundReason = event.outbound_reason || (event.meta_body && event.meta_body.reason ? event.meta_body.reason : null);
         const videoModeLine = event.video_mode ? '<p class="muted">Video mode: <strong>' + event.video_mode + '</strong></p>' : '';
+        const outboundStatusLabel = event.outbound_result ? event.outbound_result : (event.status || 'received');
+        const isOutboundStatus = ['sent', 'skipped', 'failed'].includes(outboundStatusLabel) || outboundStatusLabel.startsWith('outbound_');
+        const outboundStatusClass = isOutboundStatus
+          ? (outboundStatusLabel.startsWith('outbound_') ? outboundStatusLabel : 'outbound_' + outboundStatusLabel)
+          : outboundStatusLabel;
+        const outboundStatusDisplay = outboundStatusLabel.replace('outbound_', '').replace('_', ' ');
+        const outboundBadge = '<span class="pill pill-' + outboundStatusClass + '"' +
+          (outboundReason ? ' title="' + outboundReason + '"' : '') +
+          '>' + outboundStatusDisplay + '</span>';
+        const inboundMeta = [
+          event.video_id ? 'Video ID: <strong>' + event.video_id + '</strong>' : null,
+          event.percent !== null && event.percent !== undefined ? 'Percent: <strong>' + event.percent + '%</strong>' : null,
+          event.event_source_url ? 'Source: <span class="truncate" title="' + event.event_source_url + '">' + event.event_source_url + '</span>' : null
+        ].filter(Boolean).join(' · ');
+        const duplicateSummary = event.duplicate_count > 0
+          ? '<p class="muted">Duplicate count: <strong>' + event.duplicate_count + '</strong></p>'
+          : '';
         detailEl.innerHTML =
           '<div class="detail-header">' +
             '<div>' +
               '<h2>' + (event.event_name || 'Event detail') + '</h2>' +
-              '<p class="muted">' + (event.site_name || 'Unknown site') + ' · ' + (event.pixel_id || 'No pixel') + ' · ' + formatEventDate(event.created_at) + '</p>' +
+              '<p class="muted">' + (event.site_name || 'Unknown site') + ' · ' + (event.pixel_id || 'No pixel') + ' · ' + formatEventDate(event.received_at || event.created_at) + '</p>' +
               videoModeLine +
+              (inboundMeta ? '<p class="muted">' + inboundMeta + '</p>' : '') +
+              duplicateSummary +
             '</div>' +
             '<div class="copy-group">' +
               '<button onclick=\'navigator.clipboard.writeText(' + JSON.stringify(event.event_id || '') + ')\'>Copy event_id</button>' +
             '</div>' +
+          '</div>' +
+          '<div class="card inline-card">' +
+            '<div><strong>Outbound status:</strong> ' + outboundBadge + '</div>' +
           '</div>' +
           '<div class="tabs">' +
             '<button class="tab-button active" data-tab="inbound">Inbound</button>' +
@@ -2822,13 +2894,13 @@ app.get("/dashboard/live", requireAuth, async (req, res) => {
             '<button onclick=\'navigator.clipboard.writeText(' + JSON.stringify(JSON.stringify(event.inbound_json || {}, null, 2)) + ')\'>Copy inbound</button>' +
           '</div>' +
           '<div class="tab-content hidden" data-content="outbound">' +
-            renderJsonBlock('Outbound payload', event.outbound_json) +
-            (outboundReason ? '<p class="muted">Outbound skipped reason: ' + outboundReason + '</p>' : '') +
-            '<button onclick=\'navigator.clipboard.writeText(' + JSON.stringify(JSON.stringify(event.outbound_json || {}, null, 2)) + ')\'>Copy outbound</button>' +
+            renderJsonBlock('Outbound payload', event.outbound_request_json || event.outbound_json) +
+            (outboundReason ? '<p class="muted">Outbound reason: ' + outboundReason + '</p>' : '') +
+            '<button onclick=\'navigator.clipboard.writeText(' + JSON.stringify(JSON.stringify(event.outbound_request_json || event.outbound_json || {}, null, 2)) + ')\'>Copy outbound</button>' +
           '</div>' +
           '<div class="tab-content hidden" data-content="meta">' +
-            renderJsonBlock('Meta response', { status: event.meta_status, body: event.meta_body }) +
-            '<button onclick=\'navigator.clipboard.writeText(' + JSON.stringify(JSON.stringify({ status: event.meta_status, body: event.meta_body }, null, 2)) + ')\'>Copy response</button>' +
+            renderJsonBlock('Meta response', { status: event.meta_status, body: event.outbound_response_json || event.meta_body }) +
+            '<button onclick=\'navigator.clipboard.writeText(' + JSON.stringify(JSON.stringify({ status: event.meta_status, body: event.outbound_response_json || event.meta_body }, null, 2)) + ')\'>Copy response</button>' +
           '</div>';
 
         detailEl.querySelectorAll('.tab-button').forEach(button => {
@@ -2841,7 +2913,7 @@ app.get("/dashboard/live", requireAuth, async (req, res) => {
         });
       }
 
-      [filterSite, filterStatus].forEach(el => el.addEventListener('change', loadStream));
+      [filterSite, filterType, filterStatus].forEach(el => el.addEventListener('change', loadStream));
       filterVideo.addEventListener('input', () => {
         if (filterVideo.value.length === 0 || filterVideo.value.length > 2) {
           loadStream();
@@ -2855,6 +2927,7 @@ app.get("/dashboard/live", requireAuth, async (req, res) => {
 
       const urlParams = new URLSearchParams(window.location.search);
       if (urlParams.get('site')) filterSite.value = urlParams.get('site');
+      if (urlParams.get('event_type')) filterType.value = urlParams.get('event_type');
       if (urlParams.get('video_id')) filterVideo.value = urlParams.get('video_id');
 
       loadStream();
@@ -2877,10 +2950,12 @@ app.get("/dashboard/events/:eventId", requireAuth, async (req, res) => {
   const body = `
     <div class="card">
       <h1>${maskedEvent.event_name ?? "Event detail"}</h1>
-      <p class="muted">${maskedEvent.site_name ?? "Unknown site"} · ${maskedEvent.pixel_id ?? "No pixel"} · ${formatDate(maskedEvent.created_at)}</p>
+      <p class="muted">${maskedEvent.site_name ?? "Unknown site"} · ${maskedEvent.pixel_id ?? "No pixel"} · ${formatDate(maskedEvent.received_at || maskedEvent.created_at)}</p>
       <p class="muted">Event ID: <code>${maskedEvent.event_id ?? "—"}</code></p>
       ${maskedEvent.video_id ? `<p class="muted">Video ID: <code>${maskedEvent.video_id}</code> · ${maskedEvent.percent ?? "—"}%</p>` : ""}
       ${maskedEvent.video_mode ? `<p class="muted">Video mode: <strong>${maskedEvent.video_mode}</strong></p>` : ""}
+      ${maskedEvent.event_source_url ? `<p class="muted">Source: <span class="truncate" title="${maskedEvent.event_source_url}">${maskedEvent.event_source_url}</span></p>` : ""}
+      ${maskedEvent.outbound_result ? `<p class="muted">Outbound: <strong>${maskedEvent.outbound_result}</strong>${maskedEvent.outbound_reason ? ` (reason: ${maskedEvent.outbound_reason})` : ""}</p>` : ""}
     </div>
     <div class="card">
       <h2>Inbound payload</h2>
@@ -2888,11 +2963,11 @@ app.get("/dashboard/events/:eventId", requireAuth, async (req, res) => {
     </div>
     <div class="card">
       <h2>Outbound payload</h2>
-      <pre>${JSON.stringify(maskedEvent.outbound_json ?? {}, null, 2)}</pre>
+      <pre>${JSON.stringify(maskedEvent.outbound_request_json ?? maskedEvent.outbound_json ?? {}, null, 2)}</pre>
     </div>
     <div class="card">
       <h2>Meta response</h2>
-      <pre>${JSON.stringify({ status: maskedEvent.meta_status, body: maskedEvent.meta_body }, null, 2)}</pre>
+      <pre>${JSON.stringify({ status: maskedEvent.meta_status, body: maskedEvent.outbound_response_json ?? maskedEvent.meta_body }, null, 2)}</pre>
     </div>
   `;
 
@@ -3078,7 +3153,8 @@ app.get("/admin/events", requireAuth, async (req, res) => {
     siteId: req.query.site || undefined,
     status: req.query.status || undefined,
     eventName: req.query.event_name || undefined,
-    videoId: req.query.video_id || undefined
+    videoId: req.query.video_id || undefined,
+    eventType: req.query.event_type || undefined
   });
   res.json(events.map(event => maskEventForDisplay(event)));
 });
@@ -3087,6 +3163,37 @@ app.get("/admin/events/:eventId", requireAuth, async (req, res) => {
   const event = await getEventById(db, req.params.eventId);
   if (!event) return res.status(404).json({ error: "not found" });
   res.json(maskEventForDisplay(event));
+});
+
+app.get("/debug/pipeline", async (req, res) => {
+  let dbConnected = false;
+  let errorMessage = null;
+  try {
+    await db.get("SELECT 1");
+    dbConnected = true;
+  } catch (error) {
+    errorMessage = error.toString();
+  }
+
+  let latestInbound = null;
+  let latestOutbound = null;
+  try {
+    const inboundRow = await db.get("SELECT received_at, created_at FROM events ORDER BY id DESC LIMIT 1");
+    latestInbound = inboundRow?.received_at ?? inboundRow?.created_at ?? null;
+    const outboundRow = await db.get("SELECT attempted_at FROM outbound_logs ORDER BY id DESC LIMIT 1");
+    latestOutbound = outboundRow?.attempted_at ?? null;
+  } catch (error) {
+    errorMessage = errorMessage || error.toString();
+  }
+
+  res.json({
+    ok: true,
+    db_connected: dbConnected,
+    latest_inbound_log: latestInbound,
+    latest_outbound_log: latestOutbound,
+    backlog: null,
+    error: errorMessage
+  });
 });
 
 app.options("/v/track", publicCors);
@@ -3109,26 +3216,20 @@ app.post("/v/track", publicCors, async (req, res) => {
   }
 
   const { video_id, percent, event_id, event_source_url, watch_seconds, duration, fbp, fbc, fbclid } = req.body || {};
-  if (!video_id || percent === undefined || percent === null || !event_id) {
+  if (!video_id || percent === undefined || percent === null) {
     return res.status(400).json({ ok: false, error: "missing required fields" });
   }
 
   const video = await getVideoBySiteAndVideoId(db, site.site_id, video_id);
-  if (!video || !video.enabled) {
-    await log({
-      type: "video_event_skipped",
-      message: "video disabled",
-      site_id: site.site_id,
-      video_id,
-      percent
-    });
-    return res.json({ ok: false, reason: "video_disabled" });
-  }
-
-  const mode = normalizeVideoMode(video.mode);
+  const mode = video ? normalizeVideoMode(video.mode) : "off";
   const percentValue = Number.parseInt(percent, 10);
   const eventName = Number.isFinite(percentValue) ? `Video${percentValue}` : "Video";
-  const resolvedSourceUrl = event_source_url || video.page_url || resolveEventSourceUrl({}, req) || "";
+  const resolvedSourceUrl = event_source_url || video?.page_url || resolveEventSourceUrl({}, req) || "";
+  if (!resolvedSourceUrl) {
+    return res.status(400).json({ ok: false, error: "missing event_source_url" });
+  }
+
+  const eventId = event_id || uuid();
   const userData = {
     client_ip_address: getClientIp(req),
     client_user_agent: req.get("user-agent")
@@ -3143,7 +3244,7 @@ app.post("/v/track", publicCors, async (req, res) => {
   const inboundEvent = {
     event_name: eventName,
     event_time: Math.floor(Date.now() / 1000),
-    event_id,
+    event_id: eventId,
     action_source: "website",
     event_source_url: resolvedSourceUrl,
     user_data: userData,
@@ -3152,281 +3253,215 @@ app.post("/v/track", publicCors, async (req, res) => {
       percent: percentValue,
       watch_seconds,
       duration,
-      page_url: video.page_url
+      page_url: video?.page_url ?? null
     }
   };
   const inboundLogPayload = {
     ...inboundEvent,
     custom_data: {
       ...inboundEvent.custom_data,
-      provider: video.provider ?? null,
-      provider_video_id: video.provider_video_id ?? null
+      provider: video?.provider ?? null,
+      provider_video_id: video?.provider_video_id ?? null
     }
   };
+
+  let inboundId;
+  try {
+    inboundId = await insertEvent(db, {
+      site_id: site.site_id,
+      type: "video_milestone",
+      event_id: eventId,
+      event_name: inboundEvent.event_name,
+      video_id,
+      percent: percentValue,
+      event_source_url: resolvedSourceUrl,
+      status: "received",
+      inbound_json: JSON.stringify(sanitizePayload(inboundLogPayload, site.log_full_payloads === 1)),
+      video_mode: mode,
+      user_agent: req.get("user-agent"),
+      ip_address: getClientIp(req)
+    });
+  } catch (error) {
+    await insertError(db, { type: "db", site_id: site.site_id, event_id: eventId, message: error.toString() });
+    await log({ type: "error", message: "failed to persist inbound event", error: error.toString() });
+    return res.status(500).json({ ok: false, error: "failed to persist inbound event" });
+  }
 
   await log({
     type: "video_event_inbound",
     site_id: site.site_id,
     video_id,
     percent: percentValue,
-    mode
+    mode,
+    inbound_id: inboundId
   });
 
   const dedupTtlHours = await getSettingNumber("dedup_ttl_hours", 48);
-  const seen = await hasRecentEventId(db, site.site_id, event_id, dedupTtlHours);
-  if (seen) {
-    await insertEvent(db, {
-      site_id: site.site_id,
-      event_id,
-      event_name: inboundEvent.event_name,
-      video_id,
-      percent: percentValue,
-      event_source_url: resolvedSourceUrl,
-      status: "deduped",
-      inbound_json: JSON.stringify(sanitizePayload(inboundLogPayload, site.log_full_payloads === 1)),
-      video_mode: mode
-    });
-    await log({
-      type: "dedup",
-      message: "duplicate video event suppressed",
-      site_id: site.site_id,
-      meta: { event_id, event_name: inboundEvent.event_name }
-    });
-    return res.json({ ok: true, deduped: true });
+  if (eventId) {
+    const seen = await hasRecentEventId(db, site.site_id, eventId, dedupTtlHours);
+    if (seen) {
+      const duplicateCountRow = await db.get(
+        "SELECT COUNT(*) as count FROM events WHERE site_id = ? AND event_id = ?",
+        site.site_id,
+        eventId
+      );
+      const duplicateCount = Math.max(0, (duplicateCountRow?.count ?? 1) - 1);
+      await markInboundDuplicate(db, inboundId, duplicateCount);
+      await insertOutboundLog(db, {
+        inbound_id: inboundId,
+        mode_used: mode,
+        request_payload_json: JSON.stringify({
+          data: [sanitizePayload(inboundEvent, site.log_full_payloads === 1)]
+        }),
+        result: "skipped",
+        reason: "deduped"
+      });
+      await updateInboundOutbound(db, inboundId, { outboundResult: "skipped", outboundReason: "deduped" });
+      await log({
+        type: "dedup",
+        message: "duplicate video event received",
+        site_id: site.site_id,
+        meta: { event_id: eventId, event_name: inboundEvent.event_name }
+      });
+      await log({
+        type: "v/track",
+        message: `[v/track] inbound_saved id=${inboundId} video=${video_id} percent=${percentValue} mode=${mode} outbound=skipped reason=deduped`
+      });
+      await cleanupRetention(db, await getSettingNumber("log_retention_hours", 168));
+      return res.json({ ok: true, inbound_id: inboundId, forwarded: false, deduped: true, reason: "deduped" });
+    }
+    await storeEventId(db, site.site_id, eventId, dedupTtlHours);
   }
-  await storeEventId(db, site.site_id, event_id, dedupTtlHours);
 
-  const payload = {
+  const outboundPayload = {
     data: [inboundEvent],
     ...(mode === "test" && site.test_event_code ? { test_event_code: site.test_event_code } : {})
   };
-  const outboundLog = JSON.stringify({
-    ...payload,
+  const outboundLogPayload = JSON.stringify({
+    ...outboundPayload,
     data: [sanitizePayload(inboundEvent, site.log_full_payloads === 1)]
   });
-  const inboundLog = JSON.stringify(sanitizePayload(inboundLogPayload, site.log_full_payloads === 1));
-
-  if (mode === "off") {
-    await insertEvent(db, {
-      site_id: site.site_id,
-      event_id,
-      event_name: inboundEvent.event_name,
-      video_id,
-      percent: percentValue,
-      event_source_url: resolvedSourceUrl,
-      status: "outbound_skipped",
-      inbound_json: inboundLog,
-      outbound_json: outboundLog,
-      meta_status: 0,
-      meta_body: JSON.stringify({ reason: "video_mode_off" }),
-      video_mode: mode
-    });
-    await cleanupRetention(db, await getSettingNumber("log_retention_hours", 168));
-    await log({
-      type: "video_event_skipped",
-      reason: "video_mode_off",
-      site_id: site.site_id,
-      video_id,
-      percent: percentValue,
-      mode
-    });
-    return res.json({ ok: true, forwarded: false, reason: "video_mode_off" });
-  }
-
-  if (mode === "test" && !site.test_event_code) {
-    await insertEvent(db, {
-      site_id: site.site_id,
-      event_id,
-      event_name: inboundEvent.event_name,
-      video_id,
-      percent: percentValue,
-      event_source_url: resolvedSourceUrl,
-      status: "outbound_skipped",
-      inbound_json: inboundLog,
-      outbound_json: outboundLog,
-      meta_status: 0,
-      meta_body: JSON.stringify({ reason: "missing_test_event_code" }),
-      video_mode: mode
-    });
-    await cleanupRetention(db, await getSettingNumber("log_retention_hours", 168));
-    await log({
-      type: "video_event_skipped",
-      reason: "missing_test_event_code",
-      site_id: site.site_id,
-      video_id,
-      percent: percentValue,
-      mode
-    });
-    return res.json({ ok: true, forwarded: false, reason: "missing_test_event_code" });
-  }
 
   const accessToken = resolveAccessToken(site);
-  if (!site.pixel_id || !accessToken) {
-    await insertEvent(db, {
-      site_id: site.site_id,
-      event_id,
-      event_name: inboundEvent.event_name,
-      video_id,
-      percent: percentValue,
-      event_source_url: resolvedSourceUrl,
-      status: "outbound_skipped",
-      inbound_json: inboundLog,
-      outbound_json: outboundLog,
-      meta_status: 0,
-      meta_body: JSON.stringify({ reason: "missing_credentials" }),
-      video_mode: mode
-    });
-    await cleanupRetention(db, await getSettingNumber("log_retention_hours", 168));
-    await log({
-      type: "video_event_skipped",
-      reason: "missing_credentials",
-      site_id: site.site_id,
-      video_id,
-      percent: percentValue,
-      mode
-    });
-    return res.json({ ok: true, forwarded: false, reason: "missing_credentials" });
-  }
+  const shouldSendToMeta = site.send_to_meta && !site.dry_run;
+  let outboundResult = "skipped";
+  let outboundReason = null;
+  let forwarded = false;
+  let outboundLogged = false;
 
-  if (!site.send_to_meta || site.dry_run) {
-    const reason = site.dry_run ? "dry_run" : "send_to_meta_off";
-    await insertEvent(db, {
-      site_id: site.site_id,
-      event_id,
-      event_name: inboundEvent.event_name,
-      video_id,
-      percent: percentValue,
-      event_source_url: resolvedSourceUrl,
-      status: "outbound_skipped",
-      inbound_json: inboundLog,
-      outbound_json: outboundLog,
-      meta_status: 0,
-      meta_body: JSON.stringify({ reason }),
-      video_mode: mode
-    });
-    await cleanupRetention(db, await getSettingNumber("log_retention_hours", 168));
-    await log({
-      type: "video_event_skipped",
-      reason,
-      site_id: site.site_id,
-      video_id,
-      percent: percentValue,
-      mode
-    });
-    return res.json({ ok: true, forwarded: false, reason });
-  }
+  if (!video) {
+    outboundReason = "video_not_found";
+  } else if (!video.enabled) {
+    outboundReason = "video_disabled";
+  } else if (!shouldSendToMeta) {
+    outboundReason = site.dry_run ? "dry_run" : "send_disabled";
+  } else if (mode === "off") {
+    outboundReason = "video_mode_off";
+  } else if (!site.pixel_id || !accessToken) {
+    outboundReason = "missing_meta_credentials";
+  } else if (mode === "test" && !site.test_event_code) {
+    outboundReason = "missing_test_event_code";
+  } else if (!hasMinimumUserData(userData)) {
+    outboundReason = "insufficient_user_data";
+  } else {
+    const apiVersion = await getSettingValue("default_meta_api_version", "v24.0");
+    const url = `https://graph.facebook.com/${apiVersion}/${site.pixel_id}/events?access_token=${accessToken}`;
+    try {
+      const retryCount = await getSettingNumber("retry_count", 1);
+      const { response, body } = await sendToMeta({ url, payload: outboundPayload, retryCount });
+      const status = response.status;
+      outboundResult = response.ok ? "sent" : "failed";
+      outboundReason = response.ok ? null : status >= 500 ? "meta_5xx" : "meta_4xx";
+      forwarded = response.ok;
 
-  if (!hasMinimumUserData(userData)) {
-    await insertEvent(db, {
-      site_id: site.site_id,
-      event_id,
-      event_name: inboundEvent.event_name,
-      video_id,
-      percent: percentValue,
-      event_source_url: resolvedSourceUrl,
-      status: "outbound_skipped",
-      inbound_json: inboundLog,
-      outbound_json: outboundLog,
-      meta_status: 0,
-      meta_body: JSON.stringify({ reason: "insufficient_user_data" }),
-      video_mode: mode
-    });
-    await cleanupRetention(db, await getSettingNumber("log_retention_hours", 168));
-    await log({
-      type: "video_event_skipped",
-      reason: "insufficient_user_data",
-      site_id: site.site_id,
-      video_id,
-      percent: percentValue,
-      mode
-    });
-    return res.json({ ok: true, forwarded: false, reason: "insufficient_user_data" });
-  }
+      await insertOutboundLog(db, {
+        inbound_id: inboundId,
+        mode_used: mode,
+        request_payload_json: outboundLogPayload,
+        http_status: status,
+        response_body_json: JSON.stringify(body),
+        fbtrace_id: body?.fbtrace_id ?? null,
+        result: outboundResult,
+        reason: outboundReason
+      });
+      outboundLogged = true;
+      await updateInboundOutbound(db, inboundId, { outboundResult, outboundReason });
 
-  const apiVersion = await getSettingValue("default_meta_api_version", "v24.0");
-  const url = `https://graph.facebook.com/${apiVersion}/${site.pixel_id}/events?access_token=${accessToken}`;
+      if (!response.ok) {
+        await insertError(db, {
+          type: outboundReason,
+          site_id: site.site_id,
+          event_db_id: inboundId,
+          event_id: eventId,
+          message: "Meta API error",
+          meta_status: status,
+          meta_body: JSON.stringify(body)
+        });
+      }
 
-  try {
-    const retryCount = await getSettingNumber("retry_count", 1);
-    const { response, body } = await sendToMeta({ url, payload, retryCount });
-    const status = response.status;
-
-    await insertEvent(db, {
-      site_id: site.site_id,
-      event_id,
-      event_name: inboundEvent.event_name,
-      video_id,
-      percent: percentValue,
-      event_source_url: resolvedSourceUrl,
-      status: "outbound_sent",
-      inbound_json: inboundLog,
-      outbound_json: outboundLog,
-      meta_status: status,
-      meta_body: JSON.stringify(body),
-      video_mode: mode
-    });
-
-    if (!response.ok) {
-      const errorType = status >= 500 ? "meta_5xx" : "meta_4xx";
-      await insertError(db, {
-        type: errorType,
+      await log({
+        type: "video_event_sent",
         site_id: site.site_id,
-        event_id,
-        message: "Meta API error",
+        video_id,
+        percent: percentValue,
+        mode,
         meta_status: status,
-        meta_body: JSON.stringify(body)
+        meta_response: body
+      });
+      await logMetaSend({
+        site,
+        mode,
+        testEventCode: mode === "test" ? site.test_event_code : null,
+        status,
+        responseBody: body
+      });
+    } catch (err) {
+      outboundResult = "failed";
+      outboundReason = "exception";
+      forwarded = false;
+      await insertOutboundLog(db, {
+        inbound_id: inboundId,
+        mode_used: mode,
+        request_payload_json: outboundLogPayload,
+        result: outboundResult,
+        reason: outboundReason,
+        response_body_json: JSON.stringify({ error: err.toString() })
+      });
+      outboundLogged = true;
+      await updateInboundOutbound(db, inboundId, { outboundResult, outboundReason });
+      await insertError(db, {
+        type: "network",
+        site_id: site.site_id,
+        event_db_id: inboundId,
+        event_id: eventId,
+        message: err.toString()
       });
     }
-
-    await cleanupRetention(db, await getSettingNumber("log_retention_hours", 168));
-    await log({
-      type: "video_event_sent",
-      site_id: site.site_id,
-      video_id,
-      percent: percentValue,
-      mode,
-      meta_status: status,
-      meta_response: body
-    });
-    await logMetaSend({
-      site,
-      mode,
-      testEventCode: mode === "test" ? site.test_event_code : null,
-      status,
-      responseBody: body
-    });
-    res.status(response.ok ? 200 : status).json({
-      ok: response.ok,
-      forwarded: true,
-      meta_status: status,
-      meta_response: body
-    });
-  } catch (err) {
-    await insertEvent(db, {
-      site_id: site.site_id,
-      event_id,
-      event_name: inboundEvent.event_name,
-      video_id,
-      percent: percentValue,
-      event_source_url: resolvedSourceUrl,
-      status: "error",
-      inbound_json: inboundLog,
-      outbound_json: outboundLog,
-      meta_status: null,
-      meta_body: JSON.stringify({ error: err.toString() }),
-      video_mode: mode
-    });
-
-    await insertError(db, {
-      type: "network",
-      site_id: site.site_id,
-      event_id,
-      message: err.toString()
-    });
-
-    await cleanupRetention(db, await getSettingNumber("log_retention_hours", 168));
-    res.status(500).json({ ok: false, error: "failed to send to meta" });
   }
+
+  if (outboundReason && !outboundLogged) {
+    await insertOutboundLog(db, {
+      inbound_id: inboundId,
+      mode_used: mode,
+      request_payload_json: outboundLogPayload,
+      result: outboundResult,
+      reason: outboundReason
+    });
+    outboundLogged = true;
+    await updateInboundOutbound(db, inboundId, { outboundResult, outboundReason });
+  }
+
+  await cleanupRetention(db, await getSettingNumber("log_retention_hours", 168));
+  await log({
+    type: "v/track",
+    message: `[v/track] inbound_saved id=${inboundId} video=${video_id} percent=${percentValue} mode=${mode} outbound=${outboundResult} reason=${outboundReason || "none"}`
+  });
+  res.json({
+    ok: true,
+    inbound_id: inboundId,
+    forwarded,
+    reason: outboundReason
+  });
 });
 
 app.options("/collect", publicCors);

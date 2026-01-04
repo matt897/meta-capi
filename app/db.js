@@ -25,6 +25,7 @@ export async function initDb(dbPath) {
     CREATE TABLE IF NOT EXISTS events (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       site_id TEXT,
+      type TEXT,
       event_id TEXT,
       event_name TEXT,
       video_id TEXT,
@@ -36,7 +37,26 @@ export async function initDb(dbPath) {
       meta_status INTEGER,
       meta_body TEXT,
       video_mode TEXT,
+      user_agent TEXT,
+      ip_address TEXT,
+      received_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      last_seen_at TEXT,
+      duplicate_count INTEGER DEFAULT 0,
+      outbound_result TEXT,
+      outbound_reason TEXT,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS outbound_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      inbound_id INTEGER NOT NULL,
+      attempted_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      mode_used TEXT,
+      request_payload_json TEXT,
+      http_status INTEGER,
+      response_body_json TEXT,
+      fbtrace_id TEXT,
+      result TEXT,
+      reason TEXT
     );
     CREATE TABLE IF NOT EXISTS errors (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -116,6 +136,31 @@ export async function initDb(dbPath) {
 
   if (!eventColumnNames.has("video_mode")) {
     await db.exec("ALTER TABLE events ADD COLUMN video_mode TEXT");
+  }
+  if (!eventColumnNames.has("type")) {
+    await db.exec("ALTER TABLE events ADD COLUMN type TEXT");
+  }
+  if (!eventColumnNames.has("user_agent")) {
+    await db.exec("ALTER TABLE events ADD COLUMN user_agent TEXT");
+  }
+  if (!eventColumnNames.has("ip_address")) {
+    await db.exec("ALTER TABLE events ADD COLUMN ip_address TEXT");
+  }
+  if (!eventColumnNames.has("received_at")) {
+    await db.exec("ALTER TABLE events ADD COLUMN received_at TEXT");
+    await db.run("UPDATE events SET received_at = created_at WHERE received_at IS NULL");
+  }
+  if (!eventColumnNames.has("last_seen_at")) {
+    await db.exec("ALTER TABLE events ADD COLUMN last_seen_at TEXT");
+  }
+  if (!eventColumnNames.has("duplicate_count")) {
+    await db.exec("ALTER TABLE events ADD COLUMN duplicate_count INTEGER DEFAULT 0");
+  }
+  if (!eventColumnNames.has("outbound_result")) {
+    await db.exec("ALTER TABLE events ADD COLUMN outbound_result TEXT");
+  }
+  if (!eventColumnNames.has("outbound_reason")) {
+    await db.exec("ALTER TABLE events ADD COLUMN outbound_reason TEXT");
   }
 
   const videoColumns = await db.all("PRAGMA table_info(videos)");
@@ -262,8 +307,9 @@ export async function getSiteByKey(db, siteKey) {
 
 export async function insertEvent(db, event) {
   const result = await db.run(
-    "INSERT INTO events (site_id, event_id, event_name, video_id, percent, event_source_url, status, inbound_json, outbound_json, meta_status, meta_body, video_mode) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    "INSERT INTO events (site_id, type, event_id, event_name, video_id, percent, event_source_url, status, inbound_json, outbound_json, meta_status, meta_body, video_mode, user_agent, ip_address, received_at, last_seen_at, duplicate_count, outbound_result, outbound_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?, ?)",
     event.site_id,
+    event.type ?? null,
     event.event_id ?? null,
     event.event_name ?? null,
     event.video_id ?? null,
@@ -274,7 +320,14 @@ export async function insertEvent(db, event) {
     event.outbound_json ?? null,
     event.meta_status ?? null,
     event.meta_body ?? null,
-    event.video_mode ?? null
+    event.video_mode ?? null,
+    event.user_agent ?? null,
+    event.ip_address ?? null,
+    event.received_at ?? null,
+    event.last_seen_at ?? null,
+    event.duplicate_count ?? 0,
+    event.outbound_result ?? null,
+    event.outbound_reason ?? null
   );
   return result.lastID;
 }
@@ -290,7 +343,56 @@ export async function updateEventMeta(db, eventId, { status, outboundJson, metaS
   );
 }
 
-export async function listEvents(db, { limit = 50, siteId, status, eventName, videoId }) {
+export async function insertOutboundLog(db, outbound) {
+  const result = await db.run(
+    "INSERT INTO outbound_logs (inbound_id, mode_used, request_payload_json, http_status, response_body_json, fbtrace_id, result, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    outbound.inbound_id,
+    outbound.mode_used ?? null,
+    outbound.request_payload_json ?? null,
+    outbound.http_status ?? null,
+    outbound.response_body_json ?? null,
+    outbound.fbtrace_id ?? null,
+    outbound.result ?? null,
+    outbound.reason ?? null
+  );
+  return result.lastID;
+}
+
+export async function updateInboundOutbound(db, inboundId, { outboundResult, outboundReason, status }) {
+  await db.run(
+    "UPDATE events SET outbound_result = ?, outbound_reason = ?, status = COALESCE(?, status) WHERE id = ?",
+    outboundResult ?? null,
+    outboundReason ?? null,
+    status ?? null,
+    inboundId
+  );
+}
+
+export async function markInboundDuplicate(db, inboundId, duplicateCount = null) {
+  if (duplicateCount === null || duplicateCount === undefined) {
+    await db.run(
+      "UPDATE events SET duplicate_count = COALESCE(duplicate_count, 0) + 1, last_seen_at = CURRENT_TIMESTAMP, status = 'duplicate' WHERE id = ?",
+      inboundId
+    );
+    return;
+  }
+  await db.run(
+    "UPDATE events SET duplicate_count = ?, last_seen_at = CURRENT_TIMESTAMP, status = 'duplicate' WHERE id = ?",
+    duplicateCount,
+    inboundId
+  );
+}
+
+function safeJsonParse(value) {
+  if (!value) return null;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return { error: "invalid_json" };
+  }
+}
+
+export async function listEvents(db, { limit = 50, siteId, status, eventName, videoId, eventType }) {
   const conditions = [];
   const params = [];
 
@@ -299,8 +401,15 @@ export async function listEvents(db, { limit = 50, siteId, status, eventName, vi
     params.push(siteId);
   }
   if (status) {
-    conditions.push("events.status = ?");
-    params.push(status);
+    const normalizedStatus = String(status);
+    if (normalizedStatus.startsWith("outbound_")) {
+      const result = normalizedStatus.replace("outbound_", "");
+      conditions.push("(events.status = ? OR COALESCE(outbound.result, events.outbound_result) = ?)");
+      params.push(normalizedStatus, result);
+    } else {
+      conditions.push("events.status = ?");
+      params.push(status);
+    }
   }
   if (eventName) {
     conditions.push("events.event_name LIKE ?");
@@ -310,14 +419,38 @@ export async function listEvents(db, { limit = 50, siteId, status, eventName, vi
     conditions.push("events.video_id = ?");
     params.push(videoId);
   }
+  if (eventType) {
+    conditions.push("events.type = ?");
+    params.push(eventType);
+  }
 
   const whereClause = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
 
   const rows = await db.all(
     `
-      SELECT events.*, sites.name AS site_name, sites.pixel_id AS pixel_id
+      SELECT events.*,
+        sites.name AS site_name,
+        sites.pixel_id AS pixel_id,
+        outbound.mode_used AS outbound_mode_used,
+        outbound.request_payload_json AS outbound_request_json,
+        outbound.http_status AS outbound_http_status,
+        outbound.response_body_json AS outbound_response_json,
+        outbound.fbtrace_id AS outbound_fbtrace_id,
+        COALESCE(outbound.result, events.outbound_result) AS outbound_result,
+        COALESCE(outbound.reason, events.outbound_reason) AS outbound_reason,
+        COALESCE(outbound.http_status, events.meta_status) AS meta_status,
+        COALESCE(outbound.response_body_json, events.meta_body) AS meta_body
       FROM events
       LEFT JOIN sites ON events.site_id = sites.site_id
+      LEFT JOIN (
+        SELECT outbound_logs.*
+        FROM outbound_logs
+        INNER JOIN (
+          SELECT inbound_id, MAX(id) AS max_id
+          FROM outbound_logs
+          GROUP BY inbound_id
+        ) latest ON latest.inbound_id = outbound_logs.inbound_id AND latest.max_id = outbound_logs.id
+      ) outbound ON outbound.inbound_id = events.id
       ${whereClause}
       ORDER BY events.id DESC
       LIMIT ?
@@ -328,18 +461,40 @@ export async function listEvents(db, { limit = 50, siteId, status, eventName, vi
 
   return rows.map(row => ({
     ...row,
-    inbound_json: row.inbound_json ? JSON.parse(row.inbound_json) : null,
-    outbound_json: row.outbound_json ? JSON.parse(row.outbound_json) : null,
-    meta_body: row.meta_body ? JSON.parse(row.meta_body) : null
+    inbound_json: safeJsonParse(row.inbound_json),
+    outbound_json: safeJsonParse(row.outbound_request_json || row.outbound_json),
+    meta_body: safeJsonParse(row.meta_body),
+    outbound_request_json: safeJsonParse(row.outbound_request_json),
+    outbound_response_json: safeJsonParse(row.outbound_response_json)
   }));
 }
 
 export async function getEventById(db, eventId) {
   const row = await db.get(
     `
-      SELECT events.*, sites.name AS site_name, sites.pixel_id AS pixel_id
+      SELECT events.*,
+        sites.name AS site_name,
+        sites.pixel_id AS pixel_id,
+        outbound.mode_used AS outbound_mode_used,
+        outbound.request_payload_json AS outbound_request_json,
+        outbound.http_status AS outbound_http_status,
+        outbound.response_body_json AS outbound_response_json,
+        outbound.fbtrace_id AS outbound_fbtrace_id,
+        COALESCE(outbound.result, events.outbound_result) AS outbound_result,
+        COALESCE(outbound.reason, events.outbound_reason) AS outbound_reason,
+        COALESCE(outbound.http_status, events.meta_status) AS meta_status,
+        COALESCE(outbound.response_body_json, events.meta_body) AS meta_body
       FROM events
       LEFT JOIN sites ON events.site_id = sites.site_id
+      LEFT JOIN (
+        SELECT outbound_logs.*
+        FROM outbound_logs
+        INNER JOIN (
+          SELECT inbound_id, MAX(id) AS max_id
+          FROM outbound_logs
+          GROUP BY inbound_id
+        ) latest ON latest.inbound_id = outbound_logs.inbound_id AND latest.max_id = outbound_logs.id
+      ) outbound ON outbound.inbound_id = events.id
       WHERE events.id = ?
     `,
     eventId
@@ -347,9 +502,11 @@ export async function getEventById(db, eventId) {
   if (!row) return null;
   return {
     ...row,
-    inbound_json: row.inbound_json ? JSON.parse(row.inbound_json) : null,
-    outbound_json: row.outbound_json ? JSON.parse(row.outbound_json) : null,
-    meta_body: row.meta_body ? JSON.parse(row.meta_body) : null
+    inbound_json: safeJsonParse(row.inbound_json),
+    outbound_json: safeJsonParse(row.outbound_request_json || row.outbound_json),
+    meta_body: safeJsonParse(row.meta_body),
+    outbound_request_json: safeJsonParse(row.outbound_request_json),
+    outbound_response_json: safeJsonParse(row.outbound_response_json)
   };
 }
 
@@ -537,6 +694,10 @@ export async function countErrorsTodayBySite(db, siteId) {
 }
 
 export async function cleanupRetention(db, retentionHours) {
+  await db.run(
+    "DELETE FROM outbound_logs WHERE inbound_id IN (SELECT id FROM events WHERE created_at < datetime('now', ?))",
+    `-${retentionHours} hours`
+  );
   await db.run(
     "DELETE FROM events WHERE created_at < datetime('now', ?)",
     `-${retentionHours} hours`
