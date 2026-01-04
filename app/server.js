@@ -1205,6 +1205,7 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
     (function() {
       const SDK_VERSION = "0.1.0";
       const DEBUG_QUERY_VALUE = new URLSearchParams(window.location.search).get('capi_debug');
+      const RESET_QUERY_VALUE = new URLSearchParams(window.location.search).get('capi_reset');
       const SCRIPT = document.currentScript;
 
       function getCookieValue(name) {
@@ -1247,6 +1248,20 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
         };
       }
 
+      function createWarnOnce() {
+        const seen = new Set();
+        const prefix = '[CAPI VideoTracker]';
+        return (key, message, data) => {
+          if (seen.has(key)) return;
+          seen.add(key);
+          if (data !== undefined) {
+            console.warn(prefix, message, data);
+          } else {
+            console.warn(prefix, message);
+          }
+        };
+      }
+
       async function sha256Hex(text) {
         if (!crypto || !crypto.subtle) {
           return text;
@@ -1279,7 +1294,7 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
         }
       }
 
-      function findVideoElement(selector, log, warn, error) {
+      function findVideoElement(selector, log, warn, error, warnOnce) {
         return new Promise(resolve => {
           const start = Date.now();
           const interval = 250;
@@ -1296,6 +1311,7 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
             }
             if (Date.now() - start >= maxWait) {
               error('video element not found; aborting', { selector });
+              warnOnce('video-not-found', 'video element not found; tracker disabled', { selector });
               resolve(null);
               return;
             }
@@ -1319,6 +1335,7 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
 
         const debug = parseDebugValue(script.dataset.debug) || parseDebugValue(DEBUG_QUERY_VALUE);
         const { log, warn, error } = createLogger(debug);
+        const warnOnce = createWarnOnce();
 
         log('loaded', {
           version: SDK_VERSION,
@@ -1334,12 +1351,12 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
           const config = await configRes.json();
           log('config response', config);
           if (!config || config.enabled === false || config.mode === 'off') {
-            warn('tracking disabled by config', config);
+            warnOnce('tracking-disabled', 'tracking disabled by config', config);
             return;
           }
 
           const milestones = (config.milestones || [25, 50, 75, 95]).slice().sort((a, b) => a - b);
-          const video = await findVideoElement(selector, log, warn, error);
+          const video = await findVideoElement(selector, log, warn, error, warnOnce);
           if (!video) return;
 
           const sessionId = getSessionId();
@@ -1348,6 +1365,17 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
           let watchedSeconds = 0;
           let lastTime = video.currentTime || 0;
           let lastProgressLog = 0;
+          let loopId = null;
+
+          if (debug && parseDebugValue(RESET_QUERY_VALUE)) {
+            try {
+              localStorage.removeItem(firedStorageKey);
+              fired.clear();
+              log('reset milestones via capi_reset=1', { storageKey: firedStorageKey });
+            } catch (resetErr) {
+              warn('failed to reset milestones', resetErr);
+            }
+          }
 
           function updateFiredStorage() {
             const entries = Array.from(fired.values());
@@ -1369,7 +1397,7 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
             const now = Date.now();
             if (now - lastProgressLog < 2000) return;
             lastProgressLog = now;
-            log('progress', {
+            log('tick', {
               watchedSeconds,
               currentTime: video.currentTime,
               duration: getDuration(),
@@ -1404,7 +1432,7 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
             if (fbclid) payload.fbclid = fbclid;
 
             try {
-              log('sending milestone', { milestone: percent, event_id: eventId });
+              log('send attempt', { milestone: percent, event_id: eventId });
               const response = await fetch(baseUrl + '/v/track', {
                 method: 'POST',
                 headers: {
@@ -1436,37 +1464,72 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
             });
           }
 
+          function tick(source) {
+            if (!video) return;
+            if (video.paused || video.seeking || document.hidden) {
+              lastTime = video.currentTime || lastTime;
+              logProgress();
+              return;
+            }
+            const nowTime = video.currentTime || 0;
+            const delta = nowTime - lastTime;
+            if (delta > 0 && delta <= 5) {
+              watchedSeconds += delta;
+            } else if (delta > 5) {
+              warn('large jump ignored', { delta, source });
+            }
+            lastTime = nowTime;
+            logProgress();
+            checkMilestones();
+          }
+
+          function startLoop() {
+            if (loopId) clearInterval(loopId);
+            lastTime = video.currentTime || 0;
+            log('start loop', { currentTime: lastTime });
+            tick('start');
+            loopId = setInterval(() => tick('interval'), 250);
+          }
+
+          function stopLoop(reason) {
+            if (!loopId) return;
+            clearInterval(loopId);
+            loopId = null;
+            log('stop loop', { reason });
+          }
+
           video.addEventListener('loadedmetadata', () => {
             log('loadedmetadata', { duration: video.duration });
           });
 
           setTimeout(() => {
             if (!getDuration()) {
-              warn('duration still invalid', { duration: getDuration() });
+              warnOnce('duration-invalid', 'duration still invalid; milestones may not fire', { duration: getDuration() });
             }
           }, 5000);
 
           video.addEventListener('timeupdate', () => {
-            if (video.paused || video.seeking || document.visibilityState !== 'visible') {
-              lastTime = video.currentTime;
-              return;
-            }
-            const delta = video.currentTime - lastTime;
-            if (delta > 0 && delta < 2) {
-              watchedSeconds += delta;
-            } else if (delta >= 2) {
-              warn('large jump ignored', { delta });
-            }
-            lastTime = video.currentTime;
-            logProgress();
-            checkMilestones();
+            tick('timeupdate');
+          });
+
+          video.addEventListener('playing', () => {
+            startLoop();
+          });
+
+          video.addEventListener('pause', () => {
+            stopLoop('pause');
           });
 
           video.addEventListener('ended', () => {
             watchedSeconds = Math.max(watchedSeconds, getDuration());
             logProgress();
             checkMilestones();
+            stopLoop('ended');
           });
+
+          if (!video.paused && !video.seeking && (video.currentTime || 0) < Math.max(0, getDuration() - 0.25)) {
+            startLoop();
+          }
         } catch (err) {
           error('tracker setup failed', err);
         }
