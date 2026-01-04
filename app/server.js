@@ -1079,8 +1079,16 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
   });
   res.send(`
     (function() {
+      const SDK_VERSION = "0.1.0";
+      const DEBUG_QUERY_VALUE = new URLSearchParams(window.location.search).get('capi_debug');
+
       function getCurrentScripts() {
-        return Array.from(document.querySelectorAll('script[data-site-key][data-video-id]'));
+        const scripts = Array.from(document.querySelectorAll('script[data-site-key][data-video-id]'));
+        const current = document.currentScript || document.querySelector('script[src*="video-tracker.js"]');
+        if (current && current.dataset && current.dataset.siteKey && current.dataset.videoId && !scripts.includes(current)) {
+          scripts.unshift(current);
+        }
+        return scripts;
       }
 
       function getCookieValue(name) {
@@ -1101,6 +1109,28 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
         }
       }
 
+      function mask(value) {
+        if (!value) return '';
+        if (value.length <= 4) return '…';
+        if (value.length <= 10) return value.slice(0, 2) + '…' + value.slice(-2);
+        return value.slice(0, 6) + '…' + value.slice(-4);
+      }
+
+      function createLogger(debug) {
+        const prefix = '[CAPI VideoTracker]';
+        return {
+          log: (...args) => {
+            if (debug) console.log(prefix, ...args);
+          },
+          warn: (...args) => {
+            if (debug) console.warn(prefix, ...args);
+          },
+          error: (...args) => {
+            if (debug) console.error(prefix, ...args);
+          }
+        };
+      }
+
       async function sha256Hex(text) {
         if (!crypto || !crypto.subtle) {
           return text;
@@ -1110,26 +1140,100 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
         return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('');
       }
 
+      function parseDebugValue(value) {
+        return value === '1' || value === 'true';
+      }
+
+      function getPersistedMilestones(storageKey) {
+        try {
+          const raw = localStorage.getItem(storageKey);
+          if (!raw) return [];
+          const parsed = JSON.parse(raw);
+          return Array.isArray(parsed) ? parsed : [];
+        } catch (err) {
+          return [];
+        }
+      }
+
+      function persistMilestones(storageKey, milestones) {
+        try {
+          localStorage.setItem(storageKey, JSON.stringify(milestones));
+        } catch (err) {
+          // ignore storage errors
+        }
+      }
+
+      function findVideoElement(selector, log, warn, error) {
+        return new Promise(resolve => {
+          const start = Date.now();
+          const interval = 250;
+          const maxWait = 5000;
+          let attempt = 0;
+
+          function check() {
+            attempt += 1;
+            const element = document.querySelector(selector);
+            if (element) {
+              log('video element found', { selector, attempt });
+              resolve(element);
+              return;
+            }
+            if (Date.now() - start >= maxWait) {
+              error('video element not found; aborting', { selector });
+              resolve(null);
+              return;
+            }
+            warn('video element not found yet', { selector, attempt });
+            setTimeout(check, interval);
+          }
+
+          check();
+        });
+      }
+
       async function setupTracker(script) {
         const siteKey = script.dataset.siteKey;
         const videoId = script.dataset.videoId;
         const selector = script.dataset.selector || 'video';
         if (!siteKey || !videoId) return;
 
+        const debug = parseDebugValue(script.dataset.debug) || parseDebugValue(DEBUG_QUERY_VALUE);
+        const { log, warn, error } = createLogger(debug);
+
+        log('loaded', {
+          version: SDK_VERSION,
+          videoId,
+          selector,
+          siteKey: mask(siteKey)
+        });
+
         const baseUrl = new URL(script.src, window.location.href).origin;
         try {
+          log('fetching config', { videoId });
           const configRes = await fetch(baseUrl + '/sdk/config?site_key=' + encodeURIComponent(siteKey) + '&video_id=' + encodeURIComponent(videoId));
           const config = await configRes.json();
-          if (!config || !config.enabled) return;
+          log('config response', config);
+          if (!config || config.enabled === false || config.mode === 'off') {
+            warn('tracking disabled by config', config);
+            return;
+          }
 
           const milestones = (config.milestones || [25, 50, 75, 95]).slice().sort((a, b) => a - b);
-          const video = document.querySelector(selector);
+          const video = await findVideoElement(selector, log, warn, error);
           if (!video) return;
 
           const sessionId = getSessionId();
-          const fired = new Set();
+          const firedStorageKey = 'metaCapiVideoMilestones:' + videoId;
+          const fired = new Set(getPersistedMilestones(firedStorageKey));
           let watchedSeconds = 0;
-          let lastTime = 0;
+          let lastTime = video.currentTime || 0;
+          let lastProgressLog = 0;
+
+          function updateFiredStorage() {
+            const entries = Array.from(fired.values());
+            persistMilestones(firedStorageKey, entries);
+            log('fired set updated', entries);
+          }
 
           function getDuration() {
             return Number.isFinite(video.duration) ? video.duration : 0;
@@ -1141,9 +1245,28 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
             return Math.floor((watchedSeconds / duration) * 100);
           }
 
+          function logProgress() {
+            const now = Date.now();
+            if (now - lastProgressLog < 2000) return;
+            lastProgressLog = now;
+            log('progress', {
+              watchedSeconds,
+              currentTime: video.currentTime,
+              duration: getDuration(),
+              percent: currentPercent()
+            });
+          }
+
           async function sendMilestone(percent) {
             if (fired.has(percent)) return;
             fired.add(percent);
+            updateFiredStorage();
+            log('milestone fired', {
+              milestone: percent,
+              watchedSeconds,
+              duration: getDuration()
+            });
+
             const eventId = await sha256Hex(videoId + '|' + percent + '|' + sessionId);
             const payload = {
               video_id: videoId,
@@ -1161,7 +1284,8 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
             if (fbclid) payload.fbclid = fbclid;
 
             try {
-              await fetch(baseUrl + '/v/track', {
+              log('sending milestone', { milestone: percent, event_id: eventId });
+              const response = await fetch(baseUrl + '/v/track', {
                 method: 'POST',
                 headers: {
                   'content-type': 'application/json',
@@ -1170,8 +1294,16 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
                 body: JSON.stringify(payload),
                 keepalive: true
               });
+              log('send response', { status: response.status });
+              try {
+                const json = await response.clone().json();
+                log('send body', json);
+              } catch (parseErr) {
+                const text = await response.text();
+                log('send body', text);
+              }
             } catch (err) {
-              // fail silently
+              error('send failed', err);
             }
           }
 
@@ -1184,25 +1316,39 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
             });
           }
 
+          video.addEventListener('loadedmetadata', () => {
+            log('loadedmetadata', { duration: video.duration });
+          });
+
+          setTimeout(() => {
+            if (!getDuration()) {
+              warn('duration still invalid', { duration: getDuration() });
+            }
+          }, 5000);
+
           video.addEventListener('timeupdate', () => {
-            if (video.paused || video.seeking) {
+            if (video.paused || video.seeking || document.visibilityState !== 'visible') {
               lastTime = video.currentTime;
               return;
             }
             const delta = video.currentTime - lastTime;
             if (delta > 0 && delta < 2) {
               watchedSeconds += delta;
+            } else if (delta >= 2) {
+              warn('large jump ignored', { delta });
             }
             lastTime = video.currentTime;
+            logProgress();
             checkMilestones();
           });
 
           video.addEventListener('ended', () => {
             watchedSeconds = Math.max(watchedSeconds, getDuration());
+            logProgress();
             checkMilestones();
           });
         } catch (err) {
-          // fail silently
+          error('tracker setup failed', err);
         }
       }
 

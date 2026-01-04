@@ -61,6 +61,20 @@ The snippet loads a first-party SDK at `/sdk/video-tracker.js`. The SDK:
 - Sends events to `/v/track` with `video_id`, `percent`, and playback metrics.
   - If a video is disabled or unknown, `/v/track` responds with `{ ok: false, reason: "video_disabled" }`.
 
+### Debug logging
+
+Add `data-debug="1"` (or `data-debug="true"`) to the script tag to enable verbose console logging. You can also append `?capi_debug=1` to the page URL to turn it on without editing HTML.
+
+```html
+<script
+  src="https://capi.mattmakesmoney.com/sdk/video-tracker.js"
+  data-site-key="..."
+  data-video-id="homepage-hero-1"
+  data-selector="#capi-video-homepage-hero-1"
+  data-debug="1">
+</script>
+```
+
 ### Revocation
 
 Toggle **Enabled** off for a video in the dashboard to immediately stop tracking. The SDK checks
