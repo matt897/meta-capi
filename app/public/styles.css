@@ -232,6 +232,16 @@ td {
   color: #f97316;
 }
 
+.pill-outbound_failed {
+  background: rgba(248, 113, 113, 0.2);
+  color: #f87171;
+}
+
+.pill-duplicate {
+  background: rgba(56, 189, 248, 0.2);
+  color: #38bdf8;
+}
+
 .pill-test_event_sent,
 .pill-test_event_success {
   background: rgba(74, 222, 128, 0.2);
@@ -309,6 +319,10 @@ td {
   border-left: 4px solid #f97316;
 }
 
+.event-row.outbound_failed {
+  border-left: 4px solid #f87171;
+}
+
 .event-row.test_event_sent {
   border-left: 4px solid #4ade80;
 }
@@ -323,6 +337,10 @@ td {
 }
 
 .event-row.deduped {
+  border-left: 4px solid #38bdf8;
+}
+
+.event-row.duplicate {
   border-left: 4px solid #38bdf8;
 }
 
@@ -358,6 +376,10 @@ td {
   justify-content: space-between;
   align-items: center;
   gap: 12px;
+}
+
+.inline-card {
+  margin: 12px 0;
 }
 
 .tabs {
