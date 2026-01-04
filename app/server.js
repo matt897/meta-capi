@@ -122,6 +122,61 @@ function normalizeTimeZone(value) {
 
 let cachedTimeZone = normalizeTimeZone(await getSetting(db, "time_zone")) || DEFAULT_TIME_ZONE;
 
+function getTimeZoneParts(date, timeZone) {
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false
+  });
+  const parts = formatter.formatToParts(date);
+  const map = Object.fromEntries(parts.map(part => [part.type, part.value]));
+  return {
+    year: Number.parseInt(map.year, 10),
+    month: Number.parseInt(map.month, 10),
+    day: Number.parseInt(map.day, 10),
+    hour: Number.parseInt(map.hour, 10),
+    minute: Number.parseInt(map.minute, 10),
+    second: Number.parseInt(map.second, 10)
+  };
+}
+
+function getTimeZoneOffsetMs(date, timeZone) {
+  const parts = getTimeZoneParts(date, timeZone);
+  const utcMs = Date.UTC(
+    parts.year,
+    parts.month - 1,
+    parts.day,
+    parts.hour,
+    parts.minute,
+    parts.second
+  );
+  return utcMs - date.getTime();
+}
+
+function getStartOfDayUtcMs(timeZone, referenceDate = new Date()) {
+  const parts = getTimeZoneParts(referenceDate, timeZone);
+  const baseUtcMs = Date.UTC(parts.year, parts.month - 1, parts.day, 0, 0, 0);
+  const offsetMs = getTimeZoneOffsetMs(new Date(baseUtcMs), timeZone);
+  let candidate = baseUtcMs - offsetMs;
+  const candidateParts = getTimeZoneParts(new Date(candidate), timeZone);
+  if (candidateParts.hour !== 0 || candidateParts.minute !== 0 || candidateParts.second !== 0) {
+    const diffMs =
+      (candidateParts.hour * 3600 + candidateParts.minute * 60 + candidateParts.second) * 1000;
+    candidate -= diffMs;
+  }
+  return candidate;
+}
+
+function getNextStartOfDayUtcMs(timeZone, startUtcMs) {
+  const nextReference = new Date(startUtcMs + 36 * 60 * 60 * 1000);
+  return getStartOfDayUtcMs(timeZone, nextReference);
+}
+
 if ((await countUsers(db)) === 0) {
   const passwordHash = await bcrypt.hash(DEFAULT_ADMIN_PASSWORD, 12);
   await createUser(db, { username: DEFAULT_ADMIN_USER, password_hash: passwordHash });
@@ -722,6 +777,15 @@ function maskEventForDisplay(event) {
     outbound_request_json: maskPayloadForDisplay(event.outbound_request_json),
     outbound_response_json: event.outbound_response_json
   };
+}
+
+function safeJsonParse(value) {
+  if (!value) return null;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return { error: "invalid_json" };
+  }
 }
 
 function buildTestEvent(eventType, overrides = {}, context = {}) {
@@ -1506,9 +1570,77 @@ app.post("/admin/sites", requireAuth, async (req, res) => {
 app.get("/admin/logs", requireAuth, async (req, res) => {
   const limit = Number.parseInt(req.query.limit ?? "20", 10);
   const safeLimit = Number.isNaN(limit) ? 20 : limit;
-  const events = await listEvents(db, { limit: safeLimit });
+  const todayFilter =
+    req.query.today === "1" || req.query.today === "true" || req.query.today === "yes";
+  let receivedAtRange = null;
+  if (todayFilter) {
+    const timeZone =
+      normalizeTimeZone(req.query.time_zone) || cachedTimeZone || DEFAULT_TIME_ZONE;
+    const startUtcMs = getStartOfDayUtcMs(timeZone, new Date());
+    const endUtcMs = getNextStartOfDayUtcMs(timeZone, startUtcMs) - 1;
+    receivedAtRange = { startUtcMs, endUtcMs };
+  }
+  const events = await listEvents(db, { limit: safeLimit, receivedAtRange });
   const errors = await listRecentErrors(db, safeLimit);
   res.json({ events, errors });
+});
+
+app.get("/admin/debug/db-info", requireAuth, async (req, res) => {
+  const inboundCount = await db.get("SELECT COUNT(*) as count FROM events");
+  const outboundCount = await db.get("SELECT COUNT(*) as count FROM outbound_logs");
+  const range = await db.get(
+    "SELECT MIN(received_at_utc_ms) as min, MAX(received_at_utc_ms) as max FROM events"
+  );
+  res.json({
+    db_path: DB_PATH,
+    inbound_count: inboundCount?.count ?? 0,
+    outbound_count: outboundCount?.count ?? 0,
+    received_at_utc_ms: {
+      min: range?.min ?? null,
+      max: range?.max ?? null
+    }
+  });
+});
+
+app.get("/admin/debug/last-inbound", requireAuth, async (req, res) => {
+  const limit = Number.parseInt(req.query.limit ?? "50", 10);
+  const safeLimit = Number.isNaN(limit) ? 50 : Math.min(Math.max(limit, 1), 500);
+  const rows = await db.all(
+    "SELECT * FROM events ORDER BY received_at_utc_ms DESC, id DESC LIMIT ?",
+    safeLimit
+  );
+  res.json(
+    rows.map(row => ({
+      ...row,
+      inbound_json: safeJsonParse(row.inbound_json),
+      outbound_json: safeJsonParse(row.outbound_json),
+      meta_body: safeJsonParse(row.meta_body)
+    }))
+  );
+});
+
+app.get("/admin/debug/trace/:trace_id", requireAuth, async (req, res) => {
+  const inbound = await db.get("SELECT * FROM events WHERE trace_id = ? LIMIT 1", req.params.trace_id);
+  if (!inbound) {
+    return res.status(404).json({ error: "not found" });
+  }
+  const outboundRows = await db.all(
+    "SELECT * FROM outbound_logs WHERE inbound_id = ? ORDER BY id ASC",
+    inbound.id
+  );
+  res.json({
+    inbound: {
+      ...inbound,
+      inbound_json: safeJsonParse(inbound.inbound_json),
+      outbound_json: safeJsonParse(inbound.outbound_json),
+      meta_body: safeJsonParse(inbound.meta_body)
+    },
+    outbound: outboundRows.map(row => ({
+      ...row,
+      request_payload_json: safeJsonParse(row.request_payload_json),
+      response_body_json: safeJsonParse(row.response_body_json)
+    }))
+  });
 });
 
 function renderLoginPage({ errorMessage = "" } = {}) {
@@ -1630,7 +1762,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
             .map(
               event => `
             <tr>
-              <td>${formatDate(event.created_at)}</td>
+              <td>${formatDate(event.received_at_utc_ms ?? event.received_at ?? event.created_at)}</td>
               <td>${event.site_name ?? "—"}</td>
               <td><a href="/dashboard/events/${event.id}">${event.event_name ?? "—"}</a></td>
               <td>${event.pixel_id ?? "—"}</td>
@@ -2704,12 +2836,23 @@ app.get("/dashboard/live", requireAuth, async (req, res) => {
   const siteOptions = sites
     .map(site => `<option value="${site.site_id}">${site.name ?? site.site_id}</option>`)
     .join("");
+  const dateFilterActive =
+    req.query.today === "1" || req.query.today === "true" || req.query.today === "yes";
+  const timeZoneLabel = cachedTimeZone || DEFAULT_TIME_ZONE;
+  const logFiltersBanner = `
+    <div class="banner info">
+      <strong>Log Filters:</strong>
+      Time zone <code>${escapeHtml(timeZoneLabel)}</code> ·
+      Date filter <strong>${dateFilterActive ? "Today" : "None"}</strong>
+    </div>
+  `;
 
   const body = `
     <div class="card">
       <h1>Live Events</h1>
       <p class="muted">Auto-refreshing stream (every 2 seconds).</p>
     </div>
+    ${logFiltersBanner}
     <div class="split-pane">
       <section class="pane pane-list">
         <div class="filters">
@@ -2787,6 +2930,19 @@ app.get("/dashboard/live", requireAuth, async (req, res) => {
         return date.toLocaleString();
       }
 
+      function resolveEventTimestamp(event) {
+        if (event.received_at_utc_ms) return event.received_at_utc_ms;
+        if (event.received_at) {
+          const parsed = Date.parse(event.received_at);
+          if (!Number.isNaN(parsed)) return parsed;
+        }
+        if (event.created_at) {
+          const parsed = Date.parse(event.created_at);
+          if (!Number.isNaN(parsed)) return parsed;
+        }
+        return Date.now();
+      }
+
       function renderRow(event) {
         const row = document.createElement('div');
         const outboundStatus = event.outbound_result ? 'outbound_' + event.outbound_result : (event.status || '');
@@ -2816,6 +2972,7 @@ app.get("/dashboard/live", requireAuth, async (req, res) => {
         const outboundDisplay = outboundLabel.replace('outbound_', '').replace('_', ' ');
         const outboundReason = event.outbound_reason ? ' title="' + event.outbound_reason + '"' : '';
         const outboundBadge = '<span class="pill pill-' + outboundClass + '"' + outboundReason + '>' + outboundDisplay + '</span>';
+        const timestamp = resolveEventTimestamp(event);
         row.innerHTML =
           '<div>' +
             '<strong>' + (event.event_name || '—') + '</strong>' +
@@ -2824,7 +2981,7 @@ app.get("/dashboard/live", requireAuth, async (req, res) => {
             sourceLine +
             duplicateLine +
           '</div>' +
-          '<div class="muted">' + formatEventTime(event.received_at || event.created_at) + '</div>' +
+          '<div class="muted">' + formatEventTime(timestamp) + '</div>' +
           '<div>' + outboundBadge + '</div>';
         row.addEventListener('click', () => loadDetail(event.id));
         return row;
@@ -2868,11 +3025,12 @@ app.get("/dashboard/live", requireAuth, async (req, res) => {
         const duplicateSummary = event.duplicate_count > 0
           ? '<p class="muted">Duplicate count: <strong>' + event.duplicate_count + '</strong></p>'
           : '';
+        const timestamp = resolveEventTimestamp(event);
         detailEl.innerHTML =
           '<div class="detail-header">' +
             '<div>' +
               '<h2>' + (event.event_name || 'Event detail') + '</h2>' +
-              '<p class="muted">' + (event.site_name || 'Unknown site') + ' · ' + (event.pixel_id || 'No pixel') + ' · ' + formatEventDate(event.received_at || event.created_at) + '</p>' +
+              '<p class="muted">' + (event.site_name || 'Unknown site') + ' · ' + (event.pixel_id || 'No pixel') + ' · ' + formatEventDate(timestamp) + '</p>' +
               videoModeLine +
               (inboundMeta ? '<p class="muted">' + inboundMeta + '</p>' : '') +
               duplicateSummary +
@@ -2950,7 +3108,7 @@ app.get("/dashboard/events/:eventId", requireAuth, async (req, res) => {
   const body = `
     <div class="card">
       <h1>${maskedEvent.event_name ?? "Event detail"}</h1>
-      <p class="muted">${maskedEvent.site_name ?? "Unknown site"} · ${maskedEvent.pixel_id ?? "No pixel"} · ${formatDate(maskedEvent.received_at || maskedEvent.created_at)}</p>
+      <p class="muted">${maskedEvent.site_name ?? "Unknown site"} · ${maskedEvent.pixel_id ?? "No pixel"} · ${formatDate(maskedEvent.received_at_utc_ms ?? maskedEvent.received_at ?? maskedEvent.created_at)}</p>
       <p class="muted">Event ID: <code>${maskedEvent.event_id ?? "—"}</code></p>
       ${maskedEvent.video_id ? `<p class="muted">Video ID: <code>${maskedEvent.video_id}</code> · ${maskedEvent.percent ?? "—"}%</p>` : ""}
       ${maskedEvent.video_mode ? `<p class="muted">Video mode: <strong>${maskedEvent.video_mode}</strong></p>` : ""}
@@ -3178,8 +3336,11 @@ app.get("/debug/pipeline", async (req, res) => {
   let latestInbound = null;
   let latestOutbound = null;
   try {
-    const inboundRow = await db.get("SELECT received_at, created_at FROM events ORDER BY id DESC LIMIT 1");
-    latestInbound = inboundRow?.received_at ?? inboundRow?.created_at ?? null;
+    const inboundRow = await db.get(
+      "SELECT received_at_utc_ms, received_at, created_at FROM events ORDER BY id DESC LIMIT 1"
+    );
+    latestInbound =
+      inboundRow?.received_at_utc_ms ?? inboundRow?.received_at ?? inboundRow?.created_at ?? null;
     const outboundRow = await db.get("SELECT attempted_at FROM outbound_logs ORDER BY id DESC LIMIT 1");
     latestOutbound = outboundRow?.attempted_at ?? null;
   } catch (error) {
@@ -3215,6 +3376,7 @@ app.post("/v/track", publicCors, async (req, res) => {
     return res.status(429).json({ ok: false, error: "rate limit exceeded" });
   }
 
+  const traceId = crypto.randomUUID();
   const { video_id, percent, event_id, event_source_url, watch_seconds, duration, fbp, fbc, fbclid } = req.body || {};
   if (!video_id || percent === undefined || percent === null) {
     return res.status(400).json({ ok: false, error: "missing required fields" });
@@ -3266,6 +3428,9 @@ app.post("/v/track", publicCors, async (req, res) => {
   };
 
   let inboundId;
+  const receivedAtUtcMs = Date.now();
+  const eventTimeClient = Number.parseInt(req.body?.event_time ?? "", 10);
+  const eventTimeClientValue = Number.isNaN(eventTimeClient) ? null : eventTimeClient;
   try {
     inboundId = await insertEvent(db, {
       site_id: site.site_id,
@@ -3279,7 +3444,10 @@ app.post("/v/track", publicCors, async (req, res) => {
       inbound_json: JSON.stringify(sanitizePayload(inboundLogPayload, site.log_full_payloads === 1)),
       video_mode: mode,
       user_agent: req.get("user-agent"),
-      ip_address: getClientIp(req)
+      ip_address: getClientIp(req),
+      received_at_utc_ms: receivedAtUtcMs,
+      trace_id: traceId,
+      event_time_client: eventTimeClientValue
     });
   } catch (error) {
     await insertError(db, { type: "db", site_id: site.site_id, event_id: eventId, message: error.toString() });
@@ -3325,10 +3493,17 @@ app.post("/v/track", publicCors, async (req, res) => {
       });
       await log({
         type: "v/track",
-        message: `[v/track] inbound_saved id=${inboundId} video=${video_id} percent=${percentValue} mode=${mode} outbound=skipped reason=deduped`
+        message: `[v/track] trace=${traceId} inbound_id=${inboundId} video=${video_id} percent=${percentValue} saved_at=${receivedAtUtcMs} forward=skipped reason=deduped`
       });
       await cleanupRetention(db, await getSettingNumber("log_retention_hours", 168));
-      return res.json({ ok: true, inbound_id: inboundId, forwarded: false, deduped: true, reason: "deduped" });
+      return res.json({
+        ok: true,
+        inbound_id: inboundId,
+        trace_id: traceId,
+        forwarded: false,
+        deduped: true,
+        reason: "deduped"
+      });
     }
     await storeEventId(db, site.site_id, eventId, dedupTtlHours);
   }
@@ -3454,11 +3629,12 @@ app.post("/v/track", publicCors, async (req, res) => {
   await cleanupRetention(db, await getSettingNumber("log_retention_hours", 168));
   await log({
     type: "v/track",
-    message: `[v/track] inbound_saved id=${inboundId} video=${video_id} percent=${percentValue} mode=${mode} outbound=${outboundResult} reason=${outboundReason || "none"}`
+    message: `[v/track] trace=${traceId} inbound_id=${inboundId} video=${video_id} percent=${percentValue} saved_at=${receivedAtUtcMs} forward=${outboundResult} reason=${outboundReason || "none"}`
   });
   res.json({
     ok: true,
     inbound_id: inboundId,
+    trace_id: traceId,
     forwarded,
     reason: outboundReason
   });
@@ -3549,16 +3725,25 @@ app.post("/collect", publicCors, async (req, res) => {
     }
   }
 
+  const eventTimeClient = Number.parseInt(inboundEvent.event_time ?? "", 10);
+  const eventTimeClientValue = Number.isNaN(eventTimeClient) ? null : eventTimeClient;
+  const receivedAtUtcMs = Date.now();
+  const baseInsertPayload = {
+    site_id: site.site_id,
+    event_id: eventId,
+    event_name: inboundEvent.event_name,
+    event_source_url: inboundEvent.event_source_url,
+    event_time_client: eventTimeClientValue,
+    received_at_utc_ms: receivedAtUtcMs
+  };
+
   const dedupTtlHours = await getSettingNumber("dedup_ttl_hours", 48);
 
   if (eventId) {
     const seen = await hasRecentEventId(db, site.site_id, eventId, dedupTtlHours);
     if (seen) {
       await insertEvent(db, {
-        site_id: site.site_id,
-        event_id: eventId,
-        event_name: inboundEvent.event_name,
-        event_source_url: inboundEvent.event_source_url,
+        ...baseInsertPayload,
         status: "deduped",
         inbound_json: JSON.stringify(sanitizePayload(inboundEvent, site.log_full_payloads === 1))
       });
@@ -3590,10 +3775,7 @@ app.post("/collect", publicCors, async (req, res) => {
 
   if (!site.pixel_id || !accessToken) {
     const eventDbId = await insertEvent(db, {
-      site_id: site.site_id,
-      event_id: eventId,
-      event_name: inboundEvent.event_name,
-      event_source_url: inboundEvent.event_source_url,
+      ...baseInsertPayload,
       status: "outbound_skipped",
       inbound_json: inboundLog,
       outbound_json: outboundLog,
@@ -3607,10 +3789,7 @@ app.post("/collect", publicCors, async (req, res) => {
 
   if (!site.send_to_meta || site.dry_run) {
     const eventDbId = await insertEvent(db, {
-      site_id: site.site_id,
-      event_id: eventId,
-      event_name: inboundEvent.event_name,
-      event_source_url: inboundEvent.event_source_url,
+      ...baseInsertPayload,
       status: "outbound_skipped",
       inbound_json: inboundLog,
       outbound_json: outboundLog,
@@ -3624,10 +3803,7 @@ app.post("/collect", publicCors, async (req, res) => {
 
   if (!minimumUserDataPresent) {
     const eventDbId = await insertEvent(db, {
-      site_id: site.site_id,
-      event_id: eventId,
-      event_name: inboundEvent.event_name,
-      event_source_url: inboundEvent.event_source_url,
+      ...baseInsertPayload,
       status: "outbound_skipped",
       inbound_json: inboundLog,
       outbound_json: outboundLog,
@@ -3650,10 +3826,7 @@ app.post("/collect", publicCors, async (req, res) => {
     const status = response.status;
 
     const eventDbId = await insertEvent(db, {
-      site_id: site.site_id,
-      event_id: eventId,
-      event_name: inboundEvent.event_name,
-      event_source_url: inboundEvent.event_source_url,
+      ...baseInsertPayload,
       status: "outbound_sent",
       inbound_json: inboundLog,
       outbound_json: outboundLog,
@@ -3693,10 +3866,7 @@ app.post("/collect", publicCors, async (req, res) => {
     res.status(response.ok ? 200 : status).json({ ok: response.ok, meta: body });
   } catch (err) {
     const eventDbId = await insertEvent(db, {
-      site_id: site.site_id,
-      event_id: eventId,
-      event_name: inboundEvent.event_name,
-      event_source_url: inboundEvent.event_source_url,
+      ...baseInsertPayload,
       status: "error",
       inbound_json: inboundLog,
       outbound_json: outboundLog,
