@@ -1081,15 +1081,7 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
     (function() {
       const SDK_VERSION = "0.1.0";
       const DEBUG_QUERY_VALUE = new URLSearchParams(window.location.search).get('capi_debug');
-
-      function getCurrentScripts() {
-        const scripts = Array.from(document.querySelectorAll('script[data-site-key][data-video-id]'));
-        const current = document.currentScript || document.querySelector('script[src*="video-tracker.js"]');
-        if (current && current.dataset && current.dataset.siteKey && current.dataset.videoId && !scripts.includes(current)) {
-          scripts.unshift(current);
-        }
-        return scripts;
-      }
+      const SCRIPT = document.currentScript;
 
       function getCookieValue(name) {
         const match = document.cookie.match(new RegExp('(?:^|; )' + name.replace(/([.$?*|{}()\\[\\]\\\\/+^])/g, '\\\\$1') + '=([^;]*)'));
@@ -1195,7 +1187,11 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
         const siteKey = script.dataset.siteKey;
         const videoId = script.dataset.videoId;
         const selector = script.dataset.selector || 'video';
-        if (!siteKey || !videoId) return;
+        if (!videoId) {
+          console.warn('[CAPI VideoTracker] missing data-video-id; tracker disabled');
+          return;
+        }
+        if (!siteKey) return;
 
         const debug = parseDebugValue(script.dataset.debug) || parseDebugValue(DEBUG_QUERY_VALUE);
         const { log, warn, error } = createLogger(debug);
@@ -1352,10 +1348,11 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
         }
       }
 
-      const scripts = getCurrentScripts();
-      scripts.forEach(script => {
-        setupTracker(script);
-      });
+      if (!SCRIPT || !SCRIPT.dataset) {
+        console.warn('[CAPI VideoTracker] no currentScript found; aborting');
+        return;
+      }
+      setupTracker(SCRIPT);
     })();
   `);
 });
