@@ -4,10 +4,12 @@ import helmet from "helmet";
 import session from "express-session";
 import SQLiteStoreFactory from "connect-sqlite3";
 import { v4 as uuid } from "uuid";
+import bcrypt from "bcrypt";
 import path from "path";
 import fs from "fs";
 import {
   cleanupRetention,
+  countUsers,
   countDedupedSince,
   countErrorsSince,
   countErrorsTodayBySite,
@@ -15,9 +17,12 @@ import {
   countEventsTodayBySite,
   createSite,
   createVideo,
+  createUser,
   deleteSite,
   deleteVideo,
   ensureSetting,
+  getUserById,
+  getUserByUsername,
   getEventById,
   getSiteById,
   getSiteByKey,
@@ -36,6 +41,7 @@ import {
   listSettings,
   rotateSiteKey,
   setSetting,
+  updateUserPassword,
   storeEventId,
   updateSite,
   updateVideo,
@@ -68,10 +74,10 @@ app.use(
   })
 );
 app.use(express.urlencoded({ extended: true }));
-app.use(express.static("public"));
 
 const PORT = process.env.PORT || 3000;
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "admin123";
+const DEFAULT_ADMIN_USER = process.env.DEFAULT_ADMIN_USER || "matt";
+const DEFAULT_ADMIN_PASSWORD = process.env.DEFAULT_ADMIN_PASSWORD || "admin123";
 const SESSION_SECRET = process.env.SESSION_SECRET || "meta-capi-session";
 const DB_PATH = process.env.DB_PATH || "./data/meta-capi.sqlite";
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL?.replace(/\/+$/, "") || null;
@@ -84,7 +90,6 @@ if (!fs.existsSync(dbDir)) {
 
 const db = await initDb(DB_PATH);
 
-await ensureSetting(db, "admin_password", ADMIN_PASSWORD);
 await ensureSetting(db, "default_meta_api_version", "v24.0");
 await ensureSetting(db, "retry_count", "1");
 await ensureSetting(db, "dedup_ttl_hours", "48");
@@ -92,6 +97,11 @@ await ensureSetting(db, "log_retention_hours", "168");
 await ensureSetting(db, "hmac_required", process.env.HMAC_REQUIRED || "false");
 await ensureSetting(db, "hmac_secret", process.env.HMAC_SECRET || "");
 await ensureSetting(db, "rate_limit_per_min", process.env.RATE_LIMIT_PER_MIN || "60");
+
+if ((await countUsers(db)) === 0) {
+  const passwordHash = await bcrypt.hash(DEFAULT_ADMIN_PASSWORD, 12);
+  await createUser(db, { username: DEFAULT_ADMIN_USER, password_hash: passwordHash });
+}
 
 const SQLiteStore = SQLiteStoreFactory(session);
 const encryptionKey = (() => {
@@ -109,21 +119,18 @@ const encryptionKey = (() => {
   }
   return keyBuffer.length === 32 ? keyBuffer : null;
 })();
-const shouldUseSecureCookies = Boolean(
-  (PUBLIC_BASE_URL && PUBLIC_BASE_URL.startsWith("https://")) || process.env.COOKIE_SECURE === "true"
-);
 
 app.use(
   session({
-    store: new SQLiteStore({ db: "sessions.sqlite", dir: dbDir }),
+    store: new SQLiteStore({ db: path.basename(DB_PATH), dir: dbDir }),
     secret: SESSION_SECRET,
     resave: false,
     saveUninitialized: false,
-    proxy: shouldUseSecureCookies,
+    proxy: true,
     cookie: {
       httpOnly: true,
       sameSite: "lax",
-      secure: shouldUseSecureCookies
+      secure: "auto"
     }
   })
 );
@@ -218,10 +225,11 @@ function renderPage({ title, body, nav = true }) {
       <a href="/dashboard">Dashboard</a>
       <a href="/dashboard/sites">Sites</a>
       <a href="/dashboard/videos">Videos</a>
-      <a href="/dashboard/live">Live Events</a>
-      <a href="/dashboard/errors">Errors</a>
-      <a href="/dashboard/settings">Settings</a>
-      <a href="/logout">Logout</a>
+      <a href="/dashboard/live">Logs</a>
+      <a href="/admin/settings">Settings</a>
+      <form method="post" action="/logout" class="nav-form">
+        <button type="submit" class="nav-button">Logout</button>
+      </form>
     </nav>
   `
     : "";
@@ -245,8 +253,18 @@ function renderPage({ title, body, nav = true }) {
   `;
 }
 
-function requireLogin(req, res, next) {
-  if (!req.session?.isAdmin) {
+function wantsJson(req) {
+  if (req.path === "/admin") return false;
+  const accept = req.headers.accept || "";
+  if (accept.includes("text/html")) return false;
+  return req.path.startsWith("/admin") || accept.includes("application/json") || req.xhr;
+}
+
+function requireAuth(req, res, next) {
+  if (!req.session?.user) {
+    if (wantsJson(req)) {
+      return res.status(401).json({ ok: false, error: "unauthorized" });
+    }
     return res.redirect("/login");
   }
   next();
@@ -1133,14 +1151,17 @@ app.get("/sdk/video-tracker.js", (req, res) => {
 });
 
 app.get("/", (req, res) => {
-  res.sendFile(path.join(process.cwd(), "public", "index.html"));
+  if (req.session?.user) {
+    return res.redirect("/admin");
+  }
+  res.redirect("/login");
 });
 
-app.get("/admin", requireLogin, (req, res) => {
+app.get("/admin", requireAuth, (req, res) => {
   res.redirect("/dashboard");
 });
 
-app.get("/admin/sites", requireLogin, async (req, res) => {
+app.get("/admin/sites", requireAuth, async (req, res) => {
   const sites = await getSites(db);
   res.json(
     sites.map(site => ({
@@ -1158,7 +1179,7 @@ app.get("/admin/sites", requireLogin, async (req, res) => {
   );
 });
 
-app.post("/admin/sites/:siteId/test-event", requireLogin, async (req, res) => {
+app.post("/admin/sites/:siteId/test-event", requireAuth, async (req, res) => {
   const site = await getSiteById(db, req.params.siteId);
   if (!site) {
     return res.status(404).json({ ok: false, error: "site_not_found" });
@@ -1180,7 +1201,7 @@ app.post("/admin/sites/:siteId/test-event", requireLogin, async (req, res) => {
   res.json(result);
 });
 
-app.post("/admin/sites", requireLogin, async (req, res) => {
+app.post("/admin/sites", requireAuth, async (req, res) => {
   const {
     name,
     pixel_id,
@@ -1216,7 +1237,7 @@ app.post("/admin/sites", requireLogin, async (req, res) => {
   });
 });
 
-app.get("/admin/logs", requireLogin, async (req, res) => {
+app.get("/admin/logs", requireAuth, async (req, res) => {
   const limit = Number.parseInt(req.query.limit ?? "20", 10);
   const safeLimit = Number.isNaN(limit) ? 20 : limit;
   const events = await listEvents(db, { limit: safeLimit });
@@ -1224,59 +1245,76 @@ app.get("/admin/logs", requireLogin, async (req, res) => {
   res.json({ events, errors });
 });
 
-app.get("/login", (req, res) => {
+function renderLoginPage({ errorMessage = "" } = {}) {
+  const errorHtml = errorMessage ? `<div class="banner warning">${errorMessage}</div>` : "";
   const body = `
     <div class="card">
       <h1>Meta CAPI Gateway</h1>
       <p class="muted">Admin login</p>
+      ${errorHtml}
       <form method="post" action="/login">
+        <label>Username</label>
+        <input type="text" name="username" required />
         <label>Password</label>
         <input type="password" name="password" required />
-        <button type="submit">Login</button>
+        <button type="submit">Log in</button>
       </form>
     </div>
   `;
-  res.send(renderPage({ title: "Login", body, nav: false }));
+  return renderPage({ title: "Login", body, nav: false });
+}
+
+app.get("/login", (req, res) => {
+  if (req.session?.user) {
+    return res.redirect("/admin");
+  }
+  res.send(renderLoginPage());
 });
 
 app.post("/login", async (req, res) => {
+  const username = req.body.username ?? "";
   const password = req.body.password ?? "";
-  const adminPassword = await getSettingValue("admin_password", ADMIN_PASSWORD);
+  const user = await getUserByUsername(db, username);
+  const isValid = user ? await bcrypt.compare(password, user.password_hash) : false;
 
-  if (password !== adminPassword) {
+  if (!isValid) {
     await log({ type: "auth", message: "invalid admin login" });
-    return res.status(401).send(renderPage({
-      title: "Login",
-      nav: false,
-      body: `<div class="card"><h1>Login failed</h1><p>Invalid password.</p><a href="/login">Try again</a></div>`
-    }));
+    return res.status(401).send(renderLoginPage({ errorMessage: "Invalid username or password." }));
   }
 
-  req.session.isAdmin = true;
-  await log({ type: "auth", message: "admin login" });
-  res.redirect("/dashboard");
-});
+  const usesDefaultCreds =
+    user.username === DEFAULT_ADMIN_USER &&
+    (await bcrypt.compare(DEFAULT_ADMIN_PASSWORD, user.password_hash));
 
-app.get("/logout", (req, res) => {
-  req.session.destroy(() => {
-    res.redirect("/login");
+  req.session.regenerate(async err => {
+    if (err) {
+      await log({ type: "auth", message: "session regeneration failed", error: err.toString() });
+      return res.status(500).send(renderLoginPage({ errorMessage: "Login failed. Try again." }));
+    }
+    req.session.user = { id: user.id, username: user.username };
+    req.session.mustChangePassword = usesDefaultCreds;
+    await log({ type: "auth", message: "admin login", user: user.username });
+    res.redirect("/admin");
   });
 });
 
-app.get("/dashboard", requireLogin, async (req, res) => {
+app.post("/logout", (req, res) => {
+  req.session.destroy(() => res.redirect("/login"));
+});
+
+app.get("/dashboard", requireAuth, async (req, res) => {
   const events24h = await countEventsSince(db, 24);
   const errors24h = await countErrorsSince(db, 24);
   const deduped24h = await countDedupedSince(db, 24);
   const dedupRate = events24h ? Math.round((deduped24h / events24h) * 100) : 0;
   const recentEvents = await listEvents(db, { limit: 10 });
   const sites = await getSites(db);
-  const adminPassword = await getSettingValue("admin_password", ADMIN_PASSWORD);
   const skippedCount = await db.get(
     "SELECT COUNT(*) as count FROM events WHERE status = 'outbound_skipped' AND created_at > datetime('now', '-24 hours')"
   );
   const banners = [];
-  if (adminPassword === "admin123") {
-    banners.push(`<div class="banner warning">Default admin password in use. Update it in Settings.</div>`);
+  if (req.session.mustChangePassword) {
+    banners.push(`<div class="banner warning">Default credentials in use. Update your password in Settings.</div>`);
   }
   if (sites.length === 0) {
     banners.push(`<div class="banner info">No sites configured — add one to begin.</div>`);
@@ -1343,15 +1381,14 @@ app.get("/dashboard", requireLogin, async (req, res) => {
   res.send(renderPage({ title: "Dashboard", body }));
 });
 
-app.get("/dashboard/sites", requireLogin, async (req, res) => {
+app.get("/dashboard/sites", requireAuth, async (req, res) => {
   const sites = await getSites(db);
-  const adminPassword = await getSettingValue("admin_password", ADMIN_PASSWORD);
   const skippedCount = await db.get(
     "SELECT COUNT(*) as count FROM events WHERE status = 'outbound_skipped' AND created_at > datetime('now', '-24 hours')"
   );
   const banners = [];
-  if (adminPassword === "admin123") {
-    banners.push(`<div class="banner warning">Default admin password in use. Update it in Settings.</div>`);
+  if (req.session.mustChangePassword) {
+    banners.push(`<div class="banner warning">Default credentials in use. Update your password in Settings.</div>`);
   }
   if (sites.length === 0) {
     banners.push(`<div class="banner info">No sites configured — add one to begin.</div>`);
@@ -1446,7 +1483,7 @@ app.get("/dashboard/sites", requireLogin, async (req, res) => {
   res.send(renderPage({ title: "Sites", body }));
 });
 
-app.get("/dashboard/sites/:siteId", requireLogin, async (req, res) => {
+app.get("/dashboard/sites/:siteId", requireAuth, async (req, res) => {
   const site = await getSiteById(db, req.params.siteId);
   if (!site) {
     return res.status(404).send(renderPage({
@@ -1758,7 +1795,7 @@ app.get("/dashboard/sites/:siteId", requireLogin, async (req, res) => {
   res.send(renderPage({ title: "Site settings", body }));
 });
 
-app.post("/dashboard/sites", requireLogin, async (req, res) => {
+app.post("/dashboard/sites", requireAuth, async (req, res) => {
   const site_id = uuid();
   const site_key = uuid();
   await createSite(db, {
@@ -1776,7 +1813,7 @@ app.post("/dashboard/sites", requireLogin, async (req, res) => {
   res.redirect("/dashboard/sites");
 });
 
-app.post("/dashboard/sites/:siteId", requireLogin, async (req, res) => {
+app.post("/dashboard/sites/:siteId", requireAuth, async (req, res) => {
   const site_id = req.params.siteId;
   const existing = await getSiteById(db, site_id);
   if (!existing) {
@@ -1802,13 +1839,13 @@ app.post("/dashboard/sites/:siteId", requireLogin, async (req, res) => {
   res.redirect(`/dashboard/sites/${site_id}`);
 });
 
-app.get("/dashboard/sites/:siteId/token", requireLogin, async (req, res) => {
+app.get("/dashboard/sites/:siteId/token", requireAuth, async (req, res) => {
   const site = await getSiteById(db, req.params.siteId);
   if (!site) return res.status(404).json({ error: "not found" });
   res.json({ access_token: resolveAccessToken(site) });
 });
 
-app.post("/dashboard/sites/:siteId/test-event", requireLogin, async (req, res) => {
+app.post("/dashboard/sites/:siteId/test-event", requireAuth, async (req, res) => {
   const site = await getSiteById(db, req.params.siteId);
   if (!site) {
     return res.status(404).json({ ok: false, error: "site_not_found" });
@@ -1830,7 +1867,7 @@ app.post("/dashboard/sites/:siteId/test-event", requireLogin, async (req, res) =
   res.json(result);
 });
 
-app.post("/dashboard/sites/:siteId/rotate", requireLogin, async (req, res) => {
+app.post("/dashboard/sites/:siteId/rotate", requireAuth, async (req, res) => {
   const site_id = req.params.siteId;
   const site_key = uuid();
   await rotateSiteKey(db, site_id, site_key);
@@ -1838,14 +1875,14 @@ app.post("/dashboard/sites/:siteId/rotate", requireLogin, async (req, res) => {
   res.redirect(`/dashboard/sites/${site_id}`);
 });
 
-app.post("/dashboard/sites/:siteId/delete", requireLogin, async (req, res) => {
+app.post("/dashboard/sites/:siteId/delete", requireAuth, async (req, res) => {
   const site_id = req.params.siteId;
   await deleteSite(db, site_id);
   await log({ type: "admin", message: "site deleted", site_id });
   res.redirect("/dashboard/sites");
 });
 
-app.get("/dashboard/videos", requireLogin, async (req, res) => {
+app.get("/dashboard/videos", requireAuth, async (req, res) => {
   const videos = await listVideos(db);
   const host = resolveBaseUrl(req);
 
@@ -1972,7 +2009,7 @@ app.get("/dashboard/videos", requireLogin, async (req, res) => {
   res.send(renderPage({ title: "Videos", body }));
 });
 
-app.get("/dashboard/videos/new", requireLogin, async (req, res) => {
+app.get("/dashboard/videos/new", requireAuth, async (req, res) => {
   const sites = await getSites(db);
   const siteOptions = sites
     .map(site => `<option value="${site.site_id}">${site.name ?? site.site_id}</option>`)
@@ -2030,7 +2067,7 @@ app.get("/dashboard/videos/new", requireLogin, async (req, res) => {
   res.send(renderPage({ title: "Add video", body }));
 });
 
-app.post("/dashboard/videos", requireLogin, async (req, res) => {
+app.post("/dashboard/videos", requireAuth, async (req, res) => {
   const site = await getSiteById(db, req.body.site_id);
   if (!site) {
     return res.status(400).send(renderPage({
@@ -2082,7 +2119,7 @@ app.post("/dashboard/videos", requireLogin, async (req, res) => {
   res.redirect(`/dashboard/videos/${id}?notice=Video%20created${warningParam}`);
 });
 
-app.get("/dashboard/videos/:videoDbId", requireLogin, async (req, res) => {
+app.get("/dashboard/videos/:videoDbId", requireAuth, async (req, res) => {
   const video = await getVideoById(db, req.params.videoDbId);
   if (!video) {
     return res.status(404).send(renderPage({
@@ -2214,7 +2251,7 @@ app.get("/dashboard/videos/:videoDbId", requireLogin, async (req, res) => {
   res.send(renderPage({ title: "Edit video", body }));
 });
 
-app.post("/dashboard/videos/:videoDbId", requireLogin, async (req, res) => {
+app.post("/dashboard/videos/:videoDbId", requireAuth, async (req, res) => {
   const video = await getVideoById(db, req.params.videoDbId);
   if (!video) {
     return res.status(404).send(renderPage({
@@ -2273,7 +2310,7 @@ app.post("/dashboard/videos/:videoDbId", requireLogin, async (req, res) => {
   res.redirect(`/dashboard/videos/${video.id}?notice=Video%20updated${warningParam}`);
 });
 
-app.post("/dashboard/videos/:videoDbId/toggle", requireLogin, async (req, res) => {
+app.post("/dashboard/videos/:videoDbId/toggle", requireAuth, async (req, res) => {
   const video = await getVideoById(db, req.params.videoDbId);
   if (!video) {
     return res.status(404).send(renderPage({
@@ -2304,7 +2341,7 @@ app.post("/dashboard/videos/:videoDbId/toggle", requireLogin, async (req, res) =
   res.redirect(req.get("referer") || "/dashboard/videos");
 });
 
-app.post("/dashboard/videos/:videoDbId/delete", requireLogin, async (req, res) => {
+app.post("/dashboard/videos/:videoDbId/delete", requireAuth, async (req, res) => {
   const video = await getVideoById(db, req.params.videoDbId);
   if (video) {
     await deleteVideo(db, video.id);
@@ -2313,7 +2350,7 @@ app.post("/dashboard/videos/:videoDbId/delete", requireLogin, async (req, res) =
   res.redirect("/dashboard/videos?notice=Video%20deleted");
 });
 
-app.get("/dashboard/live", requireLogin, async (req, res) => {
+app.get("/dashboard/live", requireAuth, async (req, res) => {
   const sites = await getSites(db);
   const siteOptions = sites
     .map(site => `<option value="${site.site_id}">${site.name ?? site.site_id}</option>`)
@@ -2474,7 +2511,7 @@ app.get("/dashboard/live", requireLogin, async (req, res) => {
   res.send(renderPage({ title: "Live Events", body }));
 });
 
-app.get("/dashboard/events/:eventId", requireLogin, async (req, res) => {
+app.get("/dashboard/events/:eventId", requireAuth, async (req, res) => {
   const event = await getEventById(db, req.params.eventId);
   if (!event) {
     return res.status(404).send(renderPage({
@@ -2509,7 +2546,7 @@ app.get("/dashboard/events/:eventId", requireLogin, async (req, res) => {
   res.send(renderPage({ title: "Event detail", body }));
 });
 
-app.get("/dashboard/errors", requireLogin, async (req, res) => {
+app.get("/dashboard/errors", requireAuth, async (req, res) => {
   const selectedType = req.query.type;
   const groups = await listErrorGroups(db);
   let detailHtml = "<p class=\"muted\">Select an error type to inspect details.</p>";
@@ -2564,16 +2601,39 @@ app.get("/dashboard/errors", requireLogin, async (req, res) => {
   res.send(renderPage({ title: "Errors", body }));
 });
 
-app.get("/dashboard/settings", requireLogin, async (req, res) => {
+app.get("/dashboard/settings", requireAuth, (req, res) => {
+  res.redirect("/admin/settings");
+});
+
+app.get("/admin/settings", requireAuth, async (req, res) => {
   const settings = Object.fromEntries((await listSettings(db)).map(s => [s.key, s.value]));
+  const notice = req.query.notice ? `<div class="banner info">${escapeHtml(req.query.notice)}</div>` : "";
+  const error = req.query.error ? `<div class="banner warning">${escapeHtml(req.query.error)}</div>` : "";
   const body = `
     <div class="card">
       <h1>Settings</h1>
-      <p class="muted">Global configuration applied immediately.</p>
-      <form method="post" action="/dashboard/settings" class="form-grid">
-        <label>Admin password
-          <input name="admin_password" type="password" value="${settings.admin_password ?? ""}" />
+      <p class="muted">Manage credentials and gateway defaults.</p>
+    </div>
+    ${notice}
+    ${error}
+    <div class="card">
+      <h2>Change password</h2>
+      <form method="post" action="/admin/settings/password" class="form-grid">
+        <label>Current password
+          <input name="current_password" type="password" required />
         </label>
+        <label>New password
+          <input name="new_password" type="password" required />
+        </label>
+        <label>Confirm new password
+          <input name="confirm_password" type="password" required />
+        </label>
+        <button type="submit">Update password</button>
+      </form>
+    </div>
+    <div class="card">
+      <h2>Gateway settings</h2>
+      <form method="post" action="/admin/settings" class="form-grid">
         <label>Default Meta API version
           <input name="default_meta_api_version" value="${settings.default_meta_api_version ?? "v24.0"}" />
         </label>
@@ -2602,8 +2662,7 @@ app.get("/dashboard/settings", requireLogin, async (req, res) => {
   res.send(renderPage({ title: "Settings", body }));
 });
 
-app.post("/dashboard/settings", requireLogin, async (req, res) => {
-  await setSetting(db, "admin_password", req.body.admin_password || ADMIN_PASSWORD);
+app.post("/admin/settings", requireAuth, async (req, res) => {
   await setSetting(db, "default_meta_api_version", req.body.default_meta_api_version || "v24.0");
   await setSetting(db, "retry_count", req.body.retry_count || "1");
   await setSetting(db, "dedup_ttl_hours", req.body.dedup_ttl_hours || "48");
@@ -2612,10 +2671,47 @@ app.post("/dashboard/settings", requireLogin, async (req, res) => {
   await setSetting(db, "hmac_required", req.body.hmac_required || "false");
   await setSetting(db, "hmac_secret", req.body.hmac_secret || "");
   await log({ type: "admin", message: "settings updated" });
-  res.redirect("/dashboard/settings");
+  res.redirect("/admin/settings?notice=Settings%20updated");
 });
 
-app.get("/admin/events", requireLogin, async (req, res) => {
+app.post("/admin/settings/password", requireAuth, async (req, res) => {
+  const currentPassword = req.body.current_password ?? "";
+  const newPassword = req.body.new_password ?? "";
+  const confirmPassword = req.body.confirm_password ?? "";
+  const user = await getUserById(db, req.session.user.id);
+
+  if (!user) {
+    return res.redirect("/admin/settings?error=User%20not%20found");
+  }
+
+  const currentMatches = await bcrypt.compare(currentPassword, user.password_hash);
+  if (!currentMatches) {
+    return res.redirect("/admin/settings?error=Current%20password%20is%20incorrect");
+  }
+
+  if (newPassword.length < 10) {
+    return res.redirect("/admin/settings?error=New%20password%20must%20be%20at%20least%2010%20characters");
+  }
+
+  if (newPassword !== confirmPassword) {
+    return res.redirect("/admin/settings?error=New%20passwords%20do%20not%20match");
+  }
+
+  const newHash = await bcrypt.hash(newPassword, 12);
+  await updateUserPassword(db, user.id, newHash);
+  await log({ type: "auth", message: "password updated", user: user.username });
+
+  req.session.regenerate(err => {
+    if (err) {
+      return res.redirect("/admin/settings?error=Unable%20to%20refresh%20session");
+    }
+    req.session.user = { id: user.id, username: user.username };
+    req.session.mustChangePassword = false;
+    res.redirect("/admin/settings?notice=Password%20updated");
+  });
+});
+
+app.get("/admin/events", requireAuth, async (req, res) => {
   const limit = Number.parseInt(req.query.limit ?? "50", 10);
   const events = await listEvents(db, {
     limit: Number.isNaN(limit) ? 50 : limit,
@@ -2627,7 +2723,7 @@ app.get("/admin/events", requireLogin, async (req, res) => {
   res.json(events.map(event => maskEventForDisplay(event)));
 });
 
-app.get("/admin/events/:eventId", requireLogin, async (req, res) => {
+app.get("/admin/events/:eventId", requireAuth, async (req, res) => {
   const event = await getEventById(db, req.params.eventId);
   if (!event) return res.status(404).json({ error: "not found" });
   res.json(maskEventForDisplay(event));

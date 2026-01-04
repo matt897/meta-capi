@@ -34,13 +34,20 @@ body {
   flex-wrap: wrap;
 }
 
-.nav a {
+.nav a,
+.nav-button {
   color: var(--text);
   text-decoration: none;
   font-weight: 600;
   padding: 6px 12px;
   border-radius: 999px;
   background: rgba(148, 163, 184, 0.1);
+  border: none;
+  cursor: pointer;
+}
+
+.nav-form {
+  margin: 0;
 }
 
 .card {
