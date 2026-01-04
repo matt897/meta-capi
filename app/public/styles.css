@@ -388,6 +388,11 @@ pre {
   overflow: auto;
 }
 
+pre code {
+  display: block;
+  white-space: pre;
+}
+
 .link-card {
   text-decoration: none;
   color: var(--text);

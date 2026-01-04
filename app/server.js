@@ -1,5 +1,6 @@
 import crypto from "crypto";
 import express from "express";
+import helmet from "helmet";
 import session from "express-session";
 import SQLiteStoreFactory from "connect-sqlite3";
 import { v4 as uuid } from "uuid";
@@ -45,6 +46,20 @@ import {
 const app = express();
 app.set("trust proxy", true);
 app.use(
+  helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'", "'unsafe-inline'"],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        imgSrc: ["'self'", "data:"],
+        connectSrc: ["'self'"],
+        frameAncestors: ["'self'"]
+      }
+    }
+  })
+);
+app.use(
   express.json({
     limit: "1mb",
     verify: (req, res, buf) => {
@@ -59,6 +74,8 @@ const PORT = process.env.PORT || 3000;
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "admin123";
 const SESSION_SECRET = process.env.SESSION_SECRET || "meta-capi-session";
 const DB_PATH = process.env.DB_PATH || "./data/meta-capi.sqlite";
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL?.replace(/\/+$/, "") || null;
+const APP_ENCRYPTION_KEY = process.env.APP_ENCRYPTION_KEY || "";
 
 const dbDir = path.dirname(DB_PATH);
 if (!fs.existsSync(dbDir)) {
@@ -77,6 +94,24 @@ await ensureSetting(db, "hmac_secret", process.env.HMAC_SECRET || "");
 await ensureSetting(db, "rate_limit_per_min", process.env.RATE_LIMIT_PER_MIN || "60");
 
 const SQLiteStore = SQLiteStoreFactory(session);
+const encryptionKey = (() => {
+  if (!APP_ENCRYPTION_KEY) return null;
+  const trimmed = APP_ENCRYPTION_KEY.trim();
+  let keyBuffer = null;
+  if (/^[0-9a-f]{64}$/i.test(trimmed)) {
+    keyBuffer = Buffer.from(trimmed, "hex");
+  } else {
+    try {
+      keyBuffer = Buffer.from(trimmed, "base64");
+    } catch {
+      return null;
+    }
+  }
+  return keyBuffer.length === 32 ? keyBuffer : null;
+})();
+const shouldUseSecureCookies = Boolean(
+  (PUBLIC_BASE_URL && PUBLIC_BASE_URL.startsWith("https://")) || process.env.COOKIE_SECURE === "true"
+);
 
 app.use(
   session({
@@ -84,9 +119,11 @@ app.use(
     secret: SESSION_SECRET,
     resave: false,
     saveUninitialized: false,
+    proxy: shouldUseSecureCookies,
     cookie: {
       httpOnly: true,
-      sameSite: "lax"
+      sameSite: "lax",
+      secure: shouldUseSecureCookies
     }
   })
 );
@@ -132,6 +169,48 @@ async function log(entry) {
   console.log(redacted);
 }
 
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function encryptToken(value) {
+  if (!value) return value;
+  if (!encryptionKey) return value;
+  if (value.startsWith("enc:")) return value;
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", encryptionKey, iv);
+  const encrypted = Buffer.concat([cipher.update(value, "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return `enc:${Buffer.concat([iv, tag, encrypted]).toString("base64")}`;
+}
+
+function decryptToken(value) {
+  if (!value) return value;
+  if (!value.startsWith("enc:")) return value;
+  if (!encryptionKey) return null;
+  try {
+    const buffer = Buffer.from(value.slice(4), "base64");
+    const iv = buffer.subarray(0, 12);
+    const tag = buffer.subarray(12, 28);
+    const encrypted = buffer.subarray(28);
+    const decipher = crypto.createDecipheriv("aes-256-gcm", encryptionKey, iv);
+    decipher.setAuthTag(tag);
+    return Buffer.concat([decipher.update(encrypted), decipher.final()]).toString("utf8");
+  } catch {
+    return null;
+  }
+}
+
+function resolveAccessToken(site) {
+  if (!site?.access_token) return null;
+  return decryptToken(site.access_token);
+}
+
 function renderPage({ title, body, nav = true }) {
   const navHtml = nav
     ? `
@@ -169,15 +248,6 @@ function renderPage({ title, body, nav = true }) {
 function requireLogin(req, res, next) {
   if (!req.session?.isAdmin) {
     return res.redirect("/login");
-  }
-  next();
-}
-
-async function requireAdminHeader(req, res, next) {
-  const provided = req.get("x-admin-password");
-  const adminPassword = await getSettingValue("admin_password", ADMIN_PASSWORD);
-  if (!provided || provided !== adminPassword) {
-    return res.status(401).send("Unauthorized");
   }
   next();
 }
@@ -292,6 +362,13 @@ function buildVideoSnippet({ host, siteKey, videoId, selector }) {
 </script>`;
 }
 
+function resolveBaseUrl(req) {
+  if (PUBLIC_BASE_URL) {
+    return PUBLIC_BASE_URL;
+  }
+  return `${req.protocol}://${req.get("host")}`;
+}
+
 const VIDEO_MODE_LABELS = {
   off: "Off",
   test: "Test",
@@ -312,7 +389,8 @@ function normalizeVideoMode(value) {
 }
 
 function getSiteStatus(site) {
-  if (!site.pixel_id || !site.access_token) {
+  const accessToken = resolveAccessToken(site);
+  if (!site.pixel_id || !accessToken) {
     return "not_configured";
   }
   if (!site.send_to_meta || site.dry_run) {
@@ -606,10 +684,10 @@ function verifySignature({ secret, rawBody, signature }) {
   }
 }
 
-function checkRateLimit(siteId, limitPerMinute) {
+function checkRateLimit(key, limitPerMinute) {
   const now = Date.now();
   const windowMs = 60 * 1000;
-  const current = rateLimitState.get(siteId) || { count: 0, windowStart: now };
+  const current = rateLimitState.get(key) || { count: 0, windowStart: now };
 
   if (now - current.windowStart > windowMs) {
     current.count = 0;
@@ -617,7 +695,7 @@ function checkRateLimit(siteId, limitPerMinute) {
   }
 
   current.count += 1;
-  rateLimitState.set(siteId, current);
+  rateLimitState.set(key, current);
 
   return current.count <= limitPerMinute;
 }
@@ -674,6 +752,7 @@ function getErrorSuggestion(type) {
 }
 
 async function sendTestEvent({ site, eventType, overrides }) {
+  const accessToken = resolveAccessToken(site);
   const hashedOverrides = buildHashedUserData(overrides);
   const preparedOverrides = {
     ...overrides,
@@ -712,7 +791,7 @@ async function sendTestEvent({ site, eventType, overrides }) {
     note: ""
   };
 
-  if (!site.pixel_id || !site.access_token) {
+  if (!site.pixel_id || !accessToken) {
     await insertEvent(db, {
       site_id: site.site_id,
       event_id: event.event_id,
@@ -802,7 +881,7 @@ async function sendTestEvent({ site, eventType, overrides }) {
   }
 
   const apiVersion = await getSettingValue("default_meta_api_version", "v24.0");
-  const url = `https://graph.facebook.com/${apiVersion}/${site.pixel_id}/events?access_token=${site.access_token}`;
+  const url = `https://graph.facebook.com/${apiVersion}/${site.pixel_id}/events?access_token=${accessToken}`;
 
   try {
     const retryCount = await getSettingNumber("retry_count", 1);
@@ -1057,11 +1136,11 @@ app.get("/", (req, res) => {
   res.sendFile(path.join(process.cwd(), "public", "index.html"));
 });
 
-app.get("/admin", (req, res) => {
-  res.sendFile(path.join(process.cwd(), "public", "admin.html"));
+app.get("/admin", requireLogin, (req, res) => {
+  res.redirect("/dashboard");
 });
 
-app.get("/admin/sites", requireAdminHeader, async (req, res) => {
+app.get("/admin/sites", requireLogin, async (req, res) => {
   const sites = await getSites(db);
   res.json(
     sites.map(site => ({
@@ -1079,7 +1158,7 @@ app.get("/admin/sites", requireAdminHeader, async (req, res) => {
   );
 });
 
-app.post("/admin/sites/:siteId/test-event", requireAdminHeader, async (req, res) => {
+app.post("/admin/sites/:siteId/test-event", requireLogin, async (req, res) => {
   const site = await getSiteById(db, req.params.siteId);
   if (!site) {
     return res.status(404).json({ ok: false, error: "site_not_found" });
@@ -1101,7 +1180,7 @@ app.post("/admin/sites/:siteId/test-event", requireAdminHeader, async (req, res)
   res.json(result);
 });
 
-app.post("/admin/sites", requireAdminHeader, async (req, res) => {
+app.post("/admin/sites", requireLogin, async (req, res) => {
   const {
     name,
     pixel_id,
@@ -1120,7 +1199,7 @@ app.post("/admin/sites", requireAdminHeader, async (req, res) => {
     site_key,
     name: name || "Untitled site",
     pixel_id: pixel_id || null,
-    access_token: access_token || null,
+    access_token: encryptToken(access_token || null),
     test_event_code: test_event_code || null,
     send_to_meta: Boolean(send_to_meta),
     dry_run: dry_run === undefined ? true : Boolean(dry_run),
@@ -1137,7 +1216,7 @@ app.post("/admin/sites", requireAdminHeader, async (req, res) => {
   });
 });
 
-app.get("/admin/logs", requireAdminHeader, async (req, res) => {
+app.get("/admin/logs", requireLogin, async (req, res) => {
   const limit = Number.parseInt(req.query.limit ?? "20", 10);
   const safeLimit = Number.isNaN(limit) ? 20 : limit;
   const events = await listEvents(db, { limit: safeLimit });
@@ -1377,7 +1456,8 @@ app.get("/dashboard/sites/:siteId", requireLogin, async (req, res) => {
   }
 
   const status = renderSiteStatus(site);
-  const maskedToken = site.access_token ? maskToken(site.access_token) : "—";
+  const accessToken = resolveAccessToken(site);
+  const maskedToken = accessToken ? maskToken(accessToken) : site.access_token ? "Encrypted" : "—";
   const testEventOptions = TEST_EVENT_TYPES.map(
     type => `<option value="${type}">${type}</option>`
   ).join("");
@@ -1441,7 +1521,7 @@ app.get("/dashboard/sites/:siteId", requireLogin, async (req, res) => {
       <div id="test-event-warning" class="banner warning hidden"></div>
       <form id="test-event-form" class="form-grid"
         data-site-id="${site.site_id}"
-        data-has-credentials="${Boolean(site.pixel_id && site.access_token)}"
+        data-has-credentials="${Boolean(site.pixel_id && accessToken)}"
         data-has-test-event-code="${Boolean(site.test_event_code)}"
         data-send-to-meta="${Boolean(site.send_to_meta)}"
         data-dry-run="${Boolean(site.dry_run)}">
@@ -1686,7 +1766,7 @@ app.post("/dashboard/sites", requireLogin, async (req, res) => {
     site_key,
     name: req.body.name || "Untitled site",
     pixel_id: req.body.pixel_id || null,
-    access_token: req.body.access_token || null,
+    access_token: encryptToken(req.body.access_token || null),
     test_event_code: req.body.test_event_code || null,
     send_to_meta: Boolean(req.body.send_to_meta),
     dry_run: req.body.dry_run === undefined ? true : Boolean(req.body.dry_run),
@@ -1712,7 +1792,7 @@ app.post("/dashboard/sites/:siteId", requireLogin, async (req, res) => {
     site_id,
     name: req.body.name,
     pixel_id: req.body.pixel_id || null,
-    access_token: accessToken,
+    access_token: encryptToken(accessToken),
     test_event_code: req.body.test_event_code || null,
     send_to_meta: Boolean(req.body.send_to_meta),
     dry_run: Boolean(req.body.dry_run),
@@ -1725,7 +1805,7 @@ app.post("/dashboard/sites/:siteId", requireLogin, async (req, res) => {
 app.get("/dashboard/sites/:siteId/token", requireLogin, async (req, res) => {
   const site = await getSiteById(db, req.params.siteId);
   if (!site) return res.status(404).json({ error: "not found" });
-  res.json({ access_token: site.access_token });
+  res.json({ access_token: resolveAccessToken(site) });
 });
 
 app.post("/dashboard/sites/:siteId/test-event", requireLogin, async (req, res) => {
@@ -1767,7 +1847,7 @@ app.post("/dashboard/sites/:siteId/delete", requireLogin, async (req, res) => {
 
 app.get("/dashboard/videos", requireLogin, async (req, res) => {
   const videos = await listVideos(db);
-  const host = `${req.protocol}://${req.get("host")}`;
+  const host = resolveBaseUrl(req);
 
   const rows = videos.map(video => {
     const snippet = buildVideoSnippet({
@@ -1849,22 +1929,42 @@ app.get("/dashboard/videos", requireLogin, async (req, res) => {
       </table>
     </div>
     <script>
-      document.querySelectorAll('.copy-snippet').forEach(button => {
-        button.addEventListener('click', () => {
-          const snippet = decodeURIComponent(button.dataset.snippet || '');
-          navigator.clipboard.writeText(snippet);
-          button.textContent = 'Copied!';
-          setTimeout(() => { button.textContent = 'Copy Snippet'; }, 1500);
+      async function copyText(text) {
+        if (navigator.clipboard && window.isSecureContext) {
+          try {
+            await navigator.clipboard.writeText(text);
+            return true;
+          } catch {
+            // fallback below
+          }
+        }
+        const textarea = document.createElement('textarea');
+        textarea.value = text;
+        textarea.setAttribute('readonly', '');
+        textarea.style.position = 'absolute';
+        textarea.style.left = '-9999px';
+        document.body.appendChild(textarea);
+        textarea.select();
+        const success = document.execCommand('copy');
+        document.body.removeChild(textarea);
+        return success;
+      }
+
+      function attachCopy(button, getText, label) {
+        button.addEventListener('click', async () => {
+          const text = getText();
+          const ok = await copyText(text);
+          button.textContent = ok ? 'Copied!' : 'Copy failed';
+          setTimeout(() => { button.textContent = label; }, 1500);
         });
+      }
+
+      document.querySelectorAll('.copy-snippet').forEach(button => {
+        attachCopy(button, () => decodeURIComponent(button.dataset.snippet || ''), 'Copy Snippet');
       });
 
       document.querySelectorAll('.copy-button').forEach(button => {
-        button.addEventListener('click', () => {
-          const value = decodeURIComponent(button.dataset.copy || '');
-          navigator.clipboard.writeText(value);
-          button.textContent = 'Copied!';
-          setTimeout(() => { button.textContent = 'Copy'; }, 1500);
-        });
+        attachCopy(button, () => decodeURIComponent(button.dataset.copy || ''), 'Copy');
       });
     </script>
   `;
@@ -1995,7 +2095,7 @@ app.get("/dashboard/videos/:videoDbId", requireLogin, async (req, res) => {
   const siteOptions = sites
     .map(site => `<option value="${site.site_id}" ${site.site_id === video.site_id ? "selected" : ""}>${site.name ?? site.site_id}</option>`)
     .join("");
-  const host = `${req.protocol}://${req.get("host")}`;
+  const host = resolveBaseUrl(req);
   const snippet = buildVideoSnippet({
     host,
     siteKey: video.site_key,
@@ -2064,7 +2164,7 @@ app.get("/dashboard/videos/:videoDbId", requireLogin, async (req, res) => {
       <h2>Snippet</h2>
       <p class="muted">Milestones sent: Video25/50/75/95. <code>video_id</code> is passed in <code>custom_data</code>.</p>
       <p class="muted">Detected provider: <strong>${formatVideoProvider(video.provider)}</strong>${video.provider_video_id ? ` (ID: ${video.provider_video_id})` : ""}</p>
-      <pre>${snippet.replace(/</g, "&lt;")}</pre>
+      <pre><code id="snippet">${escapeHtml(snippet)}</code></pre>
       <button id="copy-snippet">Copy Snippet</button>
     </div>
     <div class="card">
@@ -2080,10 +2180,32 @@ app.get("/dashboard/videos/:videoDbId", requireLogin, async (req, res) => {
       </div>
     </div>
     <script>
+      async function copyText(text) {
+        if (navigator.clipboard && window.isSecureContext) {
+          try {
+            await navigator.clipboard.writeText(text);
+            return true;
+          } catch {
+            // fallback below
+          }
+        }
+        const textarea = document.createElement('textarea');
+        textarea.value = text;
+        textarea.setAttribute('readonly', '');
+        textarea.style.position = 'absolute';
+        textarea.style.left = '-9999px';
+        document.body.appendChild(textarea);
+        textarea.select();
+        const success = document.execCommand('copy');
+        document.body.removeChild(textarea);
+        return success;
+      }
+
       const copyButton = document.getElementById('copy-snippet');
-      copyButton.addEventListener('click', () => {
-        navigator.clipboard.writeText(${JSON.stringify(snippet)});
-        copyButton.textContent = 'Copied!';
+      const snippetEl = document.getElementById('snippet');
+      copyButton.addEventListener('click', async () => {
+        const ok = await copyText(snippetEl.textContent || '');
+        copyButton.textContent = ok ? 'Copied!' : 'Copy failed';
         setTimeout(() => { copyButton.textContent = 'Copy Snippet'; }, 1500);
       });
     </script>
@@ -2530,7 +2652,8 @@ app.post("/v/track", async (req, res) => {
   }
 
   const limitPerMinute = await getSettingNumber("rate_limit_per_min", 60);
-  if (!checkRateLimit(site.site_id, limitPerMinute)) {
+  const rateKey = `${site.site_key}:${getClientIp(req) || "unknown"}`;
+  if (!checkRateLimit(rateKey, limitPerMinute)) {
     await insertError(db, { type: "validation", site_id: site.site_id, message: "rate limit exceeded" });
     await log({ type: "rate_limit", message: "rate limit exceeded", site_id: site.site_id });
     return res.status(429).json({ ok: false, error: "rate limit exceeded" });
@@ -2685,7 +2808,8 @@ app.post("/v/track", async (req, res) => {
     return res.json({ ok: true, forwarded: false, reason: "missing_test_event_code" });
   }
 
-  if (!site.pixel_id || !site.access_token) {
+  const accessToken = resolveAccessToken(site);
+  if (!site.pixel_id || !accessToken) {
     await insertEvent(db, {
       site_id: site.site_id,
       event_id,
@@ -2768,7 +2892,7 @@ app.post("/v/track", async (req, res) => {
   }
 
   const apiVersion = await getSettingValue("default_meta_api_version", "v24.0");
-  const url = `https://graph.facebook.com/${apiVersion}/${site.pixel_id}/events?access_token=${site.access_token}`;
+  const url = `https://graph.facebook.com/${apiVersion}/${site.pixel_id}/events?access_token=${accessToken}`;
   if (mode === "test") {
     payload.test_event_code = site.test_event_code;
   }
@@ -2860,7 +2984,8 @@ app.post("/collect", async (req, res) => {
   }
 
   const limitPerMinute = await getSettingNumber("rate_limit_per_min", 60);
-  if (!checkRateLimit(site.site_id, limitPerMinute)) {
+  const rateKey = `${site.site_key}:${getClientIp(req) || "unknown"}`;
+  if (!checkRateLimit(rateKey, limitPerMinute)) {
     await insertError(db, { type: "validation", site_id: site.site_id, message: "rate limit exceeded" });
     await log({ type: "rate_limit", message: "rate limit exceeded", site_id: site.site_id });
     return res.status(429).json({ error: "rate limit exceeded" });
@@ -2961,8 +3086,9 @@ app.post("/collect", async (req, res) => {
     test_event_code: site.test_event_code
   };
 
+  const accessToken = resolveAccessToken(site);
   const apiVersion = await getSettingValue("default_meta_api_version", "v24.0");
-  const url = `https://graph.facebook.com/${apiVersion}/${site.pixel_id}/events?access_token=${site.access_token}`;
+  const url = `https://graph.facebook.com/${apiVersion}/${site.pixel_id}/events?access_token=${accessToken}`;
 
   const outboundLog = JSON.stringify({
     ...payload,
@@ -2970,7 +3096,7 @@ app.post("/collect", async (req, res) => {
   });
   const inboundLog = JSON.stringify(sanitizePayload(inboundEvent, site.log_full_payloads === 1));
 
-  if (!site.pixel_id || !site.access_token) {
+  if (!site.pixel_id || !accessToken) {
     const eventDbId = await insertEvent(db, {
       site_id: site.site_id,
       event_id: eventId,
