@@ -110,8 +110,34 @@ Recommended extras include `_fbp`/`_fbc` cookies or hashed identifiers (`user_da
 ## Homepage + admin APIs
 
 Previously the container returned `Cannot GET /` because no homepage route or static files were
-served at `/`. The gateway now ships a minimal developer homepage at `/` plus a header-authenticated
-admin page at `/admin` with supporting JSON endpoints (`/admin/sites`, `/admin/logs`, `/health`).
+served at `/`. The gateway now ships a minimal developer homepage at `/` plus login-gated admin
+pages and JSON endpoints (`/dashboard/*`, `/admin/*`).
+
+## Configuration
+
+Required environment variables:
+
+- `ADMIN_PASSWORD`: Admin login password (required for production use).
+- `PUBLIC_BASE_URL`: Public base URL used in generated snippets (e.g. `https://capi.mattmakesmoney.com`).
+
+Recommended / optional:
+
+- `SESSION_SECRET`: Session signing secret (defaults to `meta-capi-session`).
+- `APP_ENCRYPTION_KEY`: Optional AES-256-GCM key for encrypting access tokens at rest.
+  - Provide a 64-character hex string or base64-encoded 32-byte key.
+- `COOKIE_SECURE`: Set to `true` to force secure cookies (auto-enabled when `PUBLIC_BASE_URL` is HTTPS).
+- `DB_PATH`: SQLite database path (defaults to `./data/meta-capi.sqlite`).
+- `RATE_LIMIT_PER_MIN`: Per-site-key + IP rate limit for public ingest endpoints (defaults to `60`).
+
+## Reverse proxy deployment
+
+When running behind Nginx/Traefik/Cloudflare:
+
+- Ensure `X-Forwarded-Proto` and `X-Forwarded-For` are forwarded so the app can derive the correct
+  `https` scheme and client IPs (the app sets `trust proxy` to `true`).
+- Set `PUBLIC_BASE_URL=https://capi.mattmakesmoney.com` so snippets always reference the public
+  domain.
+- Terminate TLS at the proxy and set `COOKIE_SECURE=true` (or rely on HTTPS `PUBLIC_BASE_URL`).
 
 ## Docker notes
 
