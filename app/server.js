@@ -309,6 +309,19 @@ const VIDEO_PROVIDER_LABELS = {
   unknown: "Unknown"
 };
 
+const HTML5_VIDEO_EXTENSIONS = [".mp4", ".webm", ".ogg"];
+
+function isPlayableHtml5Source(videoSourceUrl) {
+  if (!videoSourceUrl) return false;
+  try {
+    const parsedUrl = new URL(String(videoSourceUrl).trim());
+    const path = parsedUrl.pathname.toLowerCase();
+    return HTML5_VIDEO_EXTENSIONS.some(ext => path.endsWith(ext));
+  } catch (error) {
+    return false;
+  }
+}
+
 function parseVideoSourceInfo(videoSourceUrl) {
   if (!videoSourceUrl) return { provider: null, providerVideoId: null };
   const trimmed = String(videoSourceUrl).trim();
@@ -323,7 +336,12 @@ function parseVideoSourceInfo(videoSourceUrl) {
 
   const host = parsedUrl.hostname.toLowerCase();
   const path = parsedUrl.pathname || "";
+  const lowerPath = path.toLowerCase();
   const segments = path.split("/").filter(Boolean);
+
+  if (HTML5_VIDEO_EXTENSIONS.some(ext => lowerPath.endsWith(ext))) {
+    return { provider: "html5", providerVideoId: null };
+  }
 
   if (host.includes("youtube.com") || host === "youtu.be") {
     let providerVideoId = null;
@@ -358,10 +376,6 @@ function parseVideoSourceInfo(videoSourceUrl) {
     return { provider: "s3", providerVideoId: null };
   }
 
-  if (path.toLowerCase().endsWith(".mp4")) {
-    return { provider: "html5", providerVideoId: null };
-  }
-
   return { provider: "unknown", providerVideoId: null };
 }
 
@@ -380,7 +394,31 @@ function buildVideoSnippet({ host, siteKey, videoId, selector }) {
 </script>`;
 }
 
-function resolveBaseUrl(req) {
+function buildVideoTestSnippet({ host, siteKey, videoId, videoSourceUrl, includeSource, showSourceWarning }) {
+  const videoDomId = `capi-video-${videoId}`;
+  const sourceAttribute = includeSource && videoSourceUrl ? `\n    src="${videoSourceUrl}"` : "";
+  const sourceComment = showSourceWarning
+    ? "\n  <!-- Video Source URL is not a direct HTML5 video file. Insert a source or embed manually. -->"
+    : "";
+  return `<div style="max-width: 900px; margin: 0 auto; text-align: center;">
+  <video
+    id="${videoDomId}"
+    controls
+    playsinline
+    preload="metadata"
+    style="width: 100%; max-width: 900px; border-radius: 12px;"${sourceAttribute}>
+  </video>${sourceComment}
+
+  <script
+    src="${host}/sdk/video-tracker.js"
+    data-site-key="${siteKey}"
+    data-video-id="${videoId}"
+    data-selector="#${videoDomId}">
+  </script>
+</div>`;
+}
+
+function resolveSnippetBaseUrl(req) {
   if (PUBLIC_BASE_URL) {
     return PUBLIC_BASE_URL;
   }
@@ -1884,7 +1922,7 @@ app.post("/dashboard/sites/:siteId/delete", requireAuth, async (req, res) => {
 
 app.get("/dashboard/videos", requireAuth, async (req, res) => {
   const videos = await listVideos(db);
-  const host = resolveBaseUrl(req);
+  const host = resolveSnippetBaseUrl(req);
 
   const rows = videos.map(video => {
     const snippet = buildVideoSnippet({
@@ -2132,13 +2170,25 @@ app.get("/dashboard/videos/:videoDbId", requireAuth, async (req, res) => {
   const siteOptions = sites
     .map(site => `<option value="${site.site_id}" ${site.site_id === video.site_id ? "selected" : ""}>${site.name ?? site.site_id}</option>`)
     .join("");
-  const host = resolveBaseUrl(req);
+  const host = resolveSnippetBaseUrl(req);
   const snippet = buildVideoSnippet({
     host,
     siteKey: video.site_key,
     videoId: video.video_id,
     selector: video.selector
   });
+  const isPlayableSource = isPlayableHtml5Source(video.video_source_url);
+  const needsSourceWarning = Boolean(video.video_source_url) && (video.provider !== "html5" || !isPlayableSource);
+  const testSnippet = buildVideoTestSnippet({
+    host,
+    siteKey: video.site_key,
+    videoId: video.video_id,
+    videoSourceUrl: video.video_source_url,
+    includeSource: isPlayableSource,
+    showSourceWarning: needsSourceWarning
+  });
+  const encodedSnippet = encodeURIComponent(snippet);
+  const encodedTestSnippet = encodeURIComponent(testSnippet);
   const notice = req.query.notice ? `<div class="banner info">${req.query.notice}</div>` : "";
   const warning = req.query.warning ? `<div class="banner warning">${req.query.warning}</div>` : "";
   const mode = normalizeVideoMode(video.mode);
@@ -2198,11 +2248,18 @@ app.get("/dashboard/videos/:videoDbId", requireAuth, async (req, res) => {
       </form>
     </div>
     <div class="card">
-      <h2>Snippet</h2>
+      <h2>Snippets</h2>
       <p class="muted">Milestones sent: Video25/50/75/95. <code>video_id</code> is passed in <code>custom_data</code>.</p>
       <p class="muted">Detected provider: <strong>${formatVideoProvider(video.provider)}</strong>${video.provider_video_id ? ` (ID: ${video.provider_video_id})` : ""}</p>
-      <pre><code id="snippet">${escapeHtml(snippet)}</code></pre>
-      <button id="copy-snippet">Copy Snippet</button>
+      ${needsSourceWarning ? `<div class="banner warning">Video Source URL is not a direct HTML5 video file. Self-contained test snippet will omit src.</div>` : ""}
+      <h3>Self-contained test snippet</h3>
+      <p class="muted">Paste into a blank HTML file to test tracking immediately.</p>
+      <pre><code>${escapeHtml(testSnippet)}</code></pre>
+      <button class="button secondary copy-snippet" data-snippet="${encodedTestSnippet}">Copy Test Snippet</button>
+      <h3>Minimal production snippet</h3>
+      <p class="muted">Use when embedding on your existing page.</p>
+      <pre><code>${escapeHtml(snippet)}</code></pre>
+      <button class="button secondary copy-snippet" data-snippet="${encodedSnippet}">Copy Production Snippet</button>
     </div>
     <div class="card">
       <h2>Actions</h2>
@@ -2238,12 +2295,14 @@ app.get("/dashboard/videos/:videoDbId", requireAuth, async (req, res) => {
         return success;
       }
 
-      const copyButton = document.getElementById('copy-snippet');
-      const snippetEl = document.getElementById('snippet');
-      copyButton.addEventListener('click', async () => {
-        const ok = await copyText(snippetEl.textContent || '');
-        copyButton.textContent = ok ? 'Copied!' : 'Copy failed';
-        setTimeout(() => { copyButton.textContent = 'Copy Snippet'; }, 1500);
+      document.querySelectorAll('.copy-snippet').forEach(button => {
+        button.addEventListener('click', async () => {
+          const text = decodeURIComponent(button.dataset.snippet || '');
+          const ok = await copyText(text);
+          const label = button.textContent;
+          button.textContent = ok ? 'Copied!' : 'Copy failed';
+          setTimeout(() => { button.textContent = label; }, 1500);
+        });
       });
     </script>
   `;
