@@ -1,5 +1,6 @@
 import sqlite3 from "sqlite3";
 import { open } from "sqlite";
+import fs from "fs";
 
 export async function initDb(dbPath) {
   const db = await open({
@@ -149,6 +150,50 @@ export async function initDb(dbPath) {
   if (!eventColumnNames.has("received_at")) {
     await db.exec("ALTER TABLE events ADD COLUMN received_at TEXT");
     await db.run("UPDATE events SET received_at = created_at WHERE received_at IS NULL");
+  }
+  if (!eventColumnNames.has("received_at_utc_ms")) {
+    await db.exec(
+      "ALTER TABLE events ADD COLUMN received_at_utc_ms INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER) * 1000)"
+    );
+  }
+  if (!eventColumnNames.has("trace_id")) {
+    await db.exec("ALTER TABLE events ADD COLUMN trace_id TEXT");
+  }
+  if (!eventColumnNames.has("event_time_client")) {
+    await db.exec("ALTER TABLE events ADD COLUMN event_time_client INTEGER");
+  }
+  if (!eventColumnNames.has("received_at_utc_ms")) {
+    eventColumnNames.add("received_at_utc_ms");
+  }
+  if (eventColumnNames.has("received_at_utc_ms")) {
+    const fallbackMs = (() => {
+      try {
+        if (fs.existsSync(dbPath)) {
+          const stats = fs.statSync(dbPath);
+          if (stats?.mtimeMs) {
+            return Math.floor(stats.mtimeMs);
+          }
+        }
+      } catch {
+        return Date.now();
+      }
+      return Date.now();
+    })();
+
+    await db.run(
+      `
+        UPDATE events
+        SET received_at_utc_ms = COALESCE(
+          CAST(strftime('%s', received_at) AS INTEGER) * 1000,
+          CAST(strftime('%s', created_at) AS INTEGER) * 1000
+        )
+        WHERE received_at_utc_ms IS NULL OR received_at_utc_ms = 0
+      `
+    );
+    await db.run(
+      "UPDATE events SET received_at_utc_ms = ? WHERE received_at_utc_ms IS NULL OR received_at_utc_ms = 0",
+      fallbackMs
+    );
   }
   if (!eventColumnNames.has("last_seen_at")) {
     await db.exec("ALTER TABLE events ADD COLUMN last_seen_at TEXT");
@@ -306,8 +351,9 @@ export async function getSiteByKey(db, siteKey) {
 }
 
 export async function insertEvent(db, event) {
+  const receivedAtUtcMs = event.received_at_utc_ms ?? Date.now();
   const result = await db.run(
-    "INSERT INTO events (site_id, type, event_id, event_name, video_id, percent, event_source_url, status, inbound_json, outbound_json, meta_status, meta_body, video_mode, user_agent, ip_address, received_at, last_seen_at, duplicate_count, outbound_result, outbound_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?, ?)",
+    "INSERT INTO events (site_id, type, event_id, event_name, video_id, percent, event_source_url, status, inbound_json, outbound_json, meta_status, meta_body, video_mode, user_agent, ip_address, received_at, received_at_utc_ms, trace_id, event_time_client, last_seen_at, duplicate_count, outbound_result, outbound_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?, ?, ?, ?, ?)",
     event.site_id,
     event.type ?? null,
     event.event_id ?? null,
@@ -324,6 +370,9 @@ export async function insertEvent(db, event) {
     event.user_agent ?? null,
     event.ip_address ?? null,
     event.received_at ?? null,
+    receivedAtUtcMs,
+    event.trace_id ?? null,
+    event.event_time_client ?? null,
     event.last_seen_at ?? null,
     event.duplicate_count ?? 0,
     event.outbound_result ?? null,
@@ -392,7 +441,10 @@ function safeJsonParse(value) {
   }
 }
 
-export async function listEvents(db, { limit = 50, siteId, status, eventName, videoId, eventType }) {
+export async function listEvents(
+  db,
+  { limit = 50, siteId, status, eventName, videoId, eventType, receivedAtRange }
+) {
   const conditions = [];
   const params = [];
 
@@ -423,6 +475,10 @@ export async function listEvents(db, { limit = 50, siteId, status, eventName, vi
     conditions.push("events.type = ?");
     params.push(eventType);
   }
+  if (receivedAtRange?.startUtcMs !== undefined && receivedAtRange?.endUtcMs !== undefined) {
+    conditions.push("events.received_at_utc_ms BETWEEN ? AND ?");
+    params.push(receivedAtRange.startUtcMs, receivedAtRange.endUtcMs);
+  }
 
   const whereClause = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
 
@@ -452,7 +508,7 @@ export async function listEvents(db, { limit = 50, siteId, status, eventName, vi
         ) latest ON latest.inbound_id = outbound_logs.inbound_id AND latest.max_id = outbound_logs.id
       ) outbound ON outbound.inbound_id = events.id
       ${whereClause}
-      ORDER BY events.id DESC
+      ORDER BY events.received_at_utc_ms DESC, events.id DESC
       LIMIT ?
     `,
     ...params,
