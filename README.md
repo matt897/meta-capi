@@ -48,9 +48,11 @@ curl -X POST http://localhost:3000/collect \
 ## Track HTML5 video milestones
 
 1. Go to **Videos** → **Add Video**.
-2. Select a site, paste the page URL, and optionally set a CSS selector (defaults to `video`).
-3. Save to generate a copy-paste snippet.
-4. Paste the snippet on the page containing the `<video>` element.
+2. Select a site and paste the **Page URL** (the page where the video is embedded).
+3. Optionally add the **Video Source URL** (the actual video file or provider URL like Vimeo/YouTube).
+4. Optionally set a CSS selector (defaults to `video`).
+5. Save to generate a copy-paste snippet.
+6. Paste the snippet on the page containing the `<video>` element.
 
 The snippet loads a first-party SDK at `/sdk/video-tracker.js`. The SDK:
 
@@ -68,6 +70,11 @@ Toggle **Enabled** off for a video in the dashboard to immediately stop tracking
 
 Video events are forwarded as custom events (e.g., `Video25`) with `custom_data.video_id`. Use
 those fields in Meta **Events Manager → Custom Audiences** to build retargeting segments.
+
+### Page URL vs. Video Source URL
+
+- **Page URL** is required and identifies where the video is embedded (used for event source URL and debugging).
+- **Video Source URL** is optional metadata that identifies the actual video asset (mp4, Vimeo, YouTube, Mux, etc.) for future organization and storage management.
 
 ## Minimum user_data for Meta matching
 
