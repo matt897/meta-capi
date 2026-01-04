@@ -194,6 +194,25 @@ async function log(entry) {
   console.log(redacted);
 }
 
+function maskPixelId(pixelId) {
+  if (!pixelId) return null;
+  const text = String(pixelId);
+  return text.slice(-4);
+}
+
+async function logMetaSend({ site, mode, testEventCode, status, responseBody }) {
+  await log({
+    type: "meta_send",
+    site_id: site?.site_id ?? null,
+    mode,
+    pixel_id: maskPixelId(site?.pixel_id),
+    test_event_code: Boolean(testEventCode),
+    fbtrace_id: responseBody?.fbtrace_id ?? null,
+    events_received: responseBody?.events_received ?? null,
+    meta_status: status
+  });
+}
+
 function escapeHtml(value) {
   return String(value)
     .replace(/&/g, "&amp;")
@@ -995,6 +1014,13 @@ async function sendTestEvent({ site, eventType, overrides }) {
       event_type: eventType,
       status
     });
+    await logMetaSend({
+      site,
+      mode: "test",
+      testEventCode: site.test_event_code,
+      status,
+      responseBody: body
+    });
 
     return {
       ...baseResponse,
@@ -1762,6 +1788,11 @@ app.get("/dashboard/sites/:siteId", requireAuth, async (req, res) => {
       <h2>Send Test Event</h2>
       <p class="muted">Generate a Meta test event using this site's credentials. Test events always include the site's test event code.</p>
       <p class="muted">Meta requires customer info parameters (IP/UA + identifiers) for matching.</p>
+      <div class="inline">
+        <button type="button" class="secondary" id="test-ping-button">Send test ping</button>
+        <span id="test-ping-status" class="muted"></span>
+      </div>
+      <div id="test-ping-trace" class="muted"></div>
       <div id="test-event-warning" class="banner warning hidden"></div>
       <form id="test-event-form" class="form-grid"
         data-site-id="${site.site_id}"
@@ -1817,6 +1848,7 @@ app.get("/dashboard/sites/:siteId", requireAuth, async (req, res) => {
           <span id="test-event-status" class="pill">Pending</span>
           <span id="test-event-note" class="muted"></span>
         </div>
+        <div id="test-event-fbtrace" class="muted"></div>
         <details open>
           <summary>Outbound payload</summary>
           <pre id="test-event-payload">—</pre>
@@ -1851,10 +1883,14 @@ app.get("/dashboard/sites/:siteId", requireAuth, async (req, res) => {
       const testResult = document.getElementById('test-event-result');
       const testStatus = document.getElementById('test-event-status');
       const testNote = document.getElementById('test-event-note');
+      const testFbtrace = document.getElementById('test-event-fbtrace');
       const testPayload = document.getElementById('test-event-payload');
       const testResponse = document.getElementById('test-event-response');
       const testSubmit = document.getElementById('test-event-submit');
       const testFields = testForm.querySelectorAll('[data-event-types]');
+      const testPingButton = document.getElementById('test-ping-button');
+      const testPingStatus = document.getElementById('test-ping-status');
+      const testPingTrace = document.getElementById('test-ping-trace');
 
       function updateTestFieldVisibility() {
         const selected = testType.value;
@@ -1900,6 +1936,10 @@ app.get("/dashboard/sites/:siteId", requireAuth, async (req, res) => {
           body: result.meta_response
         }, null, 2);
         testNote.textContent = result.note || '';
+        const fbtraceId = result.meta_response && result.meta_response.fbtrace_id
+          ? result.meta_response.fbtrace_id
+          : null;
+        testFbtrace.textContent = fbtraceId ? 'fbtrace_id: ' + fbtraceId : '';
         const status = inferStatus(result);
         applyStatus(status.label, status.className);
       }
@@ -1990,6 +2030,44 @@ app.get("/dashboard/sites/:siteId", requireAuth, async (req, res) => {
           testSubmit.textContent = 'Send Test Event';
         }
       });
+
+      testPingButton.addEventListener('click', async () => {
+        testPingStatus.textContent = 'Sending...';
+        testPingTrace.textContent = '';
+        testPingButton.disabled = true;
+        try {
+          const response = await fetch('/dashboard/sites/${site.site_id}/test-ping', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' }
+          });
+          const result = await response.json();
+          if (!response.ok) {
+            setWarning(result.error || 'Failed to send test ping.');
+            testPingStatus.textContent = 'Failed';
+            return;
+          }
+          renderResult(result);
+          const fbtraceId = result.meta_response && result.meta_response.fbtrace_id
+            ? result.meta_response.fbtrace_id
+            : null;
+          testPingStatus.textContent = result.forwarded === false ? 'Skipped' : 'Sent';
+          testPingTrace.textContent = fbtraceId ? 'fbtrace_id: ' + fbtraceId : '';
+          if (result.reason === 'missing_credentials') {
+            setWarning('Missing credentials. Add a Pixel ID and Access Token above to send test events.');
+          } else if (result.reason === 'missing_test_event_code') {
+            setWarning('Missing test event code. Find it in Events Manager → Test Events.');
+          } else if (result.reason === 'dry_run') {
+            setWarning('Dry-run is enabled. Disable dry-run to send test events.');
+          } else if (result.reason === 'send_disabled') {
+            setWarning('Send to Meta is disabled for this site.');
+          }
+        } catch {
+          setWarning('Request failed. Check connectivity and try again.');
+          testPingStatus.textContent = 'Failed';
+        } finally {
+          testPingButton.disabled = false;
+        }
+      });
     </script>
     <div class="card">
       <h2>Delete site</h2>
@@ -2071,6 +2149,16 @@ app.post("/dashboard/sites/:siteId/test-event", requireAuth, async (req, res) =>
     ? req.body.overrides
     : {};
   const result = await sendTestEvent({ site, eventType, overrides });
+  res.json(result);
+});
+
+app.post("/dashboard/sites/:siteId/test-ping", requireAuth, async (req, res) => {
+  const site = await getSiteById(db, req.params.siteId);
+  if (!site) {
+    return res.status(404).json({ ok: false, error: "site_not_found" });
+  }
+
+  const result = await sendTestEvent({ site, eventType: "PageView", overrides: {} });
   res.json(result);
 });
 
@@ -3256,6 +3344,13 @@ app.post("/v/track", publicCors, async (req, res) => {
       meta_status: status,
       meta_response: body
     });
+    await logMetaSend({
+      site,
+      mode,
+      testEventCode: mode === "test" ? site.test_event_code : null,
+      status,
+      responseBody: body
+    });
     res.status(response.ok ? 200 : status).json({
       ok: response.ok,
       forwarded: true,
@@ -3507,6 +3602,13 @@ app.post("/collect", publicCors, async (req, res) => {
       message: inboundEvent.event_name,
       status: status,
       meta: { response: body }
+    });
+    await logMetaSend({
+      site,
+      mode: "live",
+      testEventCode: site.test_event_code,
+      status,
+      responseBody: body
     });
 
     res.status(response.ok ? 200 : status).json({ ok: response.ok, meta: body });
