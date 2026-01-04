@@ -1,6 +1,7 @@
 import crypto from "crypto";
 import express from "express";
 import helmet from "helmet";
+import cors from "cors";
 import session from "express-session";
 import SQLiteStoreFactory from "connect-sqlite3";
 import { v4 as uuid } from "uuid";
@@ -82,6 +83,10 @@ const SESSION_SECRET = process.env.SESSION_SECRET || "meta-capi-session";
 const DB_PATH = process.env.DB_PATH || "./data/meta-capi.sqlite";
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL?.replace(/\/+$/, "") || null;
 const APP_ENCRYPTION_KEY = process.env.APP_ENCRYPTION_KEY || "";
+const CORS_ALLOWED_ORIGINS = (process.env.CORS_ALLOWED_ORIGINS || "https://mattmakesmoney.com")
+  .split(",")
+  .map(origin => origin.trim())
+  .filter(Boolean);
 
 const dbDir = path.dirname(DB_PATH);
 if (!fs.existsSync(dbDir)) {
@@ -138,6 +143,19 @@ app.use(
 app.use("/assets", express.static(path.join(process.cwd(), "public")));
 
 const rateLimitState = new Map();
+const publicCors = cors({
+  origin: (origin, callback) => {
+    if (!origin) return callback(null, false);
+    if (CORS_ALLOWED_ORIGINS.includes(origin)) {
+      return callback(null, origin);
+    }
+    return callback(null, false);
+  },
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "X-Site-Key"],
+  credentials: false,
+  optionsSuccessStatus: 204
+});
 
 const TEST_EVENT_TYPES = ["PageView", "ViewContent", "Lead", "AddToCart", "Purchase"];
 const DEFAULT_TEST_EVENT_SOURCE_URL = "https://example.com/test";
@@ -1022,8 +1040,7 @@ async function sendTestEvent({ site, eventType, overrides }) {
 
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-app.get("/sdk/config", async (req, res) => {
-  res.set("access-control-allow-origin", "*");
+app.get("/sdk/config", publicCors, async (req, res) => {
   const siteKey = req.query.site_key;
   const videoId = req.query.video_id;
   if (!siteKey || !videoId) {
@@ -1048,9 +1065,18 @@ app.get("/sdk/config", async (req, res) => {
   });
 });
 
-app.get("/sdk/video-tracker.js", (req, res) => {
-  res.set("content-type", "application/javascript");
-  res.set("access-control-allow-origin", "*");
+app.get("/sdk/video-tracker.js", async (req, res) => {
+  res.set("content-type", "application/javascript; charset=utf-8");
+  res.set("cross-origin-resource-policy", "cross-origin");
+  res.set("cache-control", "public, max-age=300");
+  res.removeHeader("cross-origin-embedder-policy");
+  res.removeHeader("cross-origin-opener-policy");
+  await log({
+    type: "sdk_script_request",
+    origin: req.get("origin") || null,
+    referer: req.get("referer") || null,
+    headers: req.headers
+  });
   res.send(`
     (function() {
       function getCurrentScripts() {
@@ -2788,15 +2814,8 @@ app.get("/admin/events/:eventId", requireAuth, async (req, res) => {
   res.json(maskEventForDisplay(event));
 });
 
-app.options("/v/track", (req, res) => {
-  res.set("access-control-allow-origin", "*");
-  res.set("access-control-allow-headers", "content-type,x-site-key");
-  res.set("access-control-allow-methods", "POST,OPTIONS");
-  res.status(204).send();
-});
-
-app.post("/v/track", async (req, res) => {
-  res.set("access-control-allow-origin", "*");
+app.options("/v/track", publicCors);
+app.post("/v/track", publicCors, async (req, res) => {
   const siteKey = req.headers["x-site-key"] || req.body?.site_key;
   const site = siteKey ? await getSiteByKey(db, siteKey) : null;
 
@@ -3128,7 +3147,8 @@ app.post("/v/track", async (req, res) => {
   }
 });
 
-app.post("/collect", async (req, res) => {
+app.options("/collect", publicCors);
+app.post("/collect", publicCors, async (req, res) => {
   const siteKey = req.headers["x-site-key"];
   const site = siteKey ? await getSiteByKey(db, siteKey) : null;
 
