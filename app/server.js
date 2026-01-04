@@ -80,8 +80,9 @@ app.use(
 app.use(express.urlencoded({ extended: true }));
 
 const PORT = process.env.PORT || 3000;
-const DEFAULT_ADMIN_USER = process.env.DEFAULT_ADMIN_USER || "matt";
-const DEFAULT_ADMIN_PASSWORD = process.env.DEFAULT_ADMIN_PASSWORD || "admin123";
+const DEFAULT_ADMIN_USER = process.env.ADMIN_USER || process.env.DEFAULT_ADMIN_USER || "admin";
+const DEFAULT_ADMIN_PASSWORD =
+  process.env.ADMIN_PASSWORD || process.env.DEFAULT_ADMIN_PASSWORD || "admin123";
 const SESSION_SECRET = process.env.SESSION_SECRET || "meta-capi-session";
 const DB_PATH = process.env.DB_PATH || "./data/meta-capi.sqlite";
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL?.replace(/\/+$/, "") || null;
