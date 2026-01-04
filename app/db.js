@@ -41,6 +41,7 @@ export async function initDb(dbPath) {
       user_agent TEXT,
       ip_address TEXT,
       received_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      received_at_utc_ms INTEGER,
       last_seen_at TEXT,
       duplicate_count INTEGER DEFAULT 0,
       outbound_result TEXT,
@@ -152,9 +153,7 @@ export async function initDb(dbPath) {
     await db.run("UPDATE events SET received_at = created_at WHERE received_at IS NULL");
   }
   if (!eventColumnNames.has("received_at_utc_ms")) {
-    await db.exec(
-      "ALTER TABLE events ADD COLUMN received_at_utc_ms INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER) * 1000)"
-    );
+    await db.exec("ALTER TABLE events ADD COLUMN received_at_utc_ms INTEGER");
   }
   if (!eventColumnNames.has("trace_id")) {
     await db.exec("ALTER TABLE events ADD COLUMN trace_id TEXT");
