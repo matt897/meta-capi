@@ -53,6 +53,13 @@ export async function initDb(dbPath) {
       key TEXT PRIMARY KEY,
       value TEXT
     );
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      username TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
     CREATE TABLE IF NOT EXISTS event_dedup (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       site_id TEXT,
@@ -173,6 +180,35 @@ export async function setSetting(db, key, value) {
 
 export async function listSettings(db) {
   return db.all("SELECT key, value FROM settings");
+}
+
+export async function countUsers(db) {
+  const row = await db.get("SELECT COUNT(*) as count FROM users");
+  return row?.count ?? 0;
+}
+
+export async function createUser(db, user) {
+  await db.run(
+    "INSERT INTO users (username, password_hash) VALUES (?, ?)",
+    user.username,
+    user.password_hash
+  );
+}
+
+export async function getUserByUsername(db, username) {
+  return db.get("SELECT * FROM users WHERE username = ?", username);
+}
+
+export async function getUserById(db, userId) {
+  return db.get("SELECT * FROM users WHERE id = ?", userId);
+}
+
+export async function updateUserPassword(db, userId, passwordHash) {
+  await db.run(
+    "UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+    passwordHash,
+    userId
+  );
 }
 
 export async function createSite(db, site) {
