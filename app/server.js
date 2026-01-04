@@ -3152,7 +3152,10 @@ app.post("/v/track", publicCors, async (req, res) => {
   }
   await storeEventId(db, site.site_id, event_id, dedupTtlHours);
 
-  const payload = { data: [inboundEvent] };
+  const payload = {
+    data: [inboundEvent],
+    ...(mode === "test" && site.test_event_code ? { test_event_code: site.test_event_code } : {})
+  };
   const outboundLog = JSON.stringify({
     ...payload,
     data: [sanitizePayload(inboundEvent, site.log_full_payloads === 1)]
@@ -3298,9 +3301,6 @@ app.post("/v/track", publicCors, async (req, res) => {
 
   const apiVersion = await getSettingValue("default_meta_api_version", "v24.0");
   const url = `https://graph.facebook.com/${apiVersion}/${site.pixel_id}/events?access_token=${accessToken}`;
-  if (mode === "test") {
-    payload.test_event_code = site.test_event_code;
-  }
 
   try {
     const retryCount = await getSettingNumber("retry_count", 1);
