@@ -210,6 +210,78 @@ function slugify(value) {
     .slice(0, 64);
 }
 
+const VIDEO_PROVIDER_LABELS = {
+  html5: "HTML5",
+  vimeo: "Vimeo",
+  youtube: "YouTube",
+  mux: "Mux",
+  cloudflare: "Cloudflare",
+  s3: "S3",
+  r2: "R2",
+  unknown: "Unknown"
+};
+
+function parseVideoSourceInfo(videoSourceUrl) {
+  if (!videoSourceUrl) return { provider: null, providerVideoId: null };
+  const trimmed = String(videoSourceUrl).trim();
+  if (!trimmed) return { provider: null, providerVideoId: null };
+
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(trimmed);
+  } catch (error) {
+    return { provider: "unknown", providerVideoId: null };
+  }
+
+  const host = parsedUrl.hostname.toLowerCase();
+  const path = parsedUrl.pathname || "";
+  const segments = path.split("/").filter(Boolean);
+
+  if (host.includes("youtube.com") || host === "youtu.be") {
+    let providerVideoId = null;
+    if (host === "youtu.be") {
+      providerVideoId = segments[0] || null;
+    } else if (path.startsWith("/watch")) {
+      providerVideoId = parsedUrl.searchParams.get("v");
+    } else if (path.startsWith("/embed/") || path.startsWith("/shorts/")) {
+      providerVideoId = segments[1] || null;
+    }
+    return { provider: "youtube", providerVideoId: providerVideoId || null };
+  }
+
+  if (host.includes("vimeo.com")) {
+    const match = path.match(/\/(\d+)/);
+    return { provider: "vimeo", providerVideoId: match ? match[1] : null };
+  }
+
+  if (host.includes("mux.com")) {
+    return { provider: "mux", providerVideoId: segments[0] || null };
+  }
+
+  if (host.includes("videodelivery.net")) {
+    return { provider: "cloudflare", providerVideoId: segments[0] || null };
+  }
+
+  if (host.includes("r2.cloudflarestorage.com")) {
+    return { provider: "r2", providerVideoId: null };
+  }
+
+  if (host.includes("amazonaws.com")) {
+    return { provider: "s3", providerVideoId: null };
+  }
+
+  if (path.toLowerCase().endsWith(".mp4")) {
+    return { provider: "html5", providerVideoId: null };
+  }
+
+  return { provider: "unknown", providerVideoId: null };
+}
+
+function formatVideoProvider(provider) {
+  if (!provider) return "Unknown";
+  return VIDEO_PROVIDER_LABELS[provider] || provider;
+}
+
 function buildVideoSnippet({ host, siteKey, videoId, selector }) {
   const safeSelector = selector || "video";
   return `<script
@@ -1706,6 +1778,9 @@ app.get("/dashboard/videos", requireLogin, async (req, res) => {
     });
     const encodedSnippet = encodeURIComponent(snippet);
     const mode = normalizeVideoMode(video.mode);
+    const providerLabel = formatVideoProvider(video.provider);
+    const providerDetails = video.provider_video_id ? `${providerLabel} (${video.provider_video_id})` : providerLabel;
+    const sourceUrl = video.video_source_url || "";
     return `
       <tr>
         <td>
@@ -1714,6 +1789,15 @@ app.get("/dashboard/videos", requireLogin, async (req, res) => {
         </td>
         <td>${video.site_name ?? "—"}</td>
         <td>${video.page_url ?? "—"}</td>
+        <td>
+          <span class="pill pill-provider">${providerDetails || "Unknown"}</span>
+        </td>
+        <td>
+          ${sourceUrl
+            ? `<div class="truncate" title="${sourceUrl}">${sourceUrl}</div>
+               <button class="button secondary copy-button" data-copy="${encodeURIComponent(sourceUrl)}">Copy</button>`
+            : "—"}
+        </td>
         <td>${video.enabled ? renderStatusPill("enabled") : renderStatusPill("disabled")}</td>
         <td>
           ${renderStatusPill(mode)}
@@ -1752,13 +1836,15 @@ app.get("/dashboard/videos", requireLogin, async (req, res) => {
             <th>Video</th>
             <th>Site</th>
             <th>Page URL</th>
+            <th>Provider</th>
+            <th>Video Source URL</th>
             <th>Status</th>
             <th>Mode</th>
             <th>Actions</th>
           </tr>
         </thead>
         <tbody>
-          ${rows.join("") || "<tr><td colspan=\"6\" class=\"muted\">No videos yet.</td></tr>"}
+          ${rows.join("") || "<tr><td colspan=\"8\" class=\"muted\">No videos yet.</td></tr>"}
         </tbody>
       </table>
     </div>
@@ -1769,6 +1855,15 @@ app.get("/dashboard/videos", requireLogin, async (req, res) => {
           navigator.clipboard.writeText(snippet);
           button.textContent = 'Copied!';
           setTimeout(() => { button.textContent = 'Copy Snippet'; }, 1500);
+        });
+      });
+
+      document.querySelectorAll('.copy-button').forEach(button => {
+        button.addEventListener('click', () => {
+          const value = decodeURIComponent(button.dataset.copy || '');
+          navigator.clipboard.writeText(value);
+          button.textContent = 'Copied!';
+          setTimeout(() => { button.textContent = 'Copy'; }, 1500);
         });
       });
     </script>
@@ -1800,6 +1895,10 @@ app.get("/dashboard/videos/new", requireLogin, async (req, res) => {
         </label>
         <label>Page URL
           <input name="page_url" required placeholder="https://example.com/video-page" />
+        </label>
+        <label>Video source URL (optional)
+          <input name="video_source_url" placeholder="https://player.vimeo.com/video/12345" />
+          <span class="muted">The actual video file or provider URL (mp4, Vimeo, YouTube, etc.). Used for identification and management.</span>
         </label>
         <label>Video name (optional)
           <input name="name" placeholder="Homepage hero video" />
@@ -1840,6 +1939,13 @@ app.post("/dashboard/videos", requireLogin, async (req, res) => {
     }));
   }
 
+  if (!req.body.page_url?.trim()) {
+    return res.status(400).send(renderPage({
+      title: "Missing page URL",
+      body: `<div class="card"><h1>Page URL required</h1><p class="muted">Add the page URL where the video is embedded.</p></div>`
+    }));
+  }
+
   const rawSlug = req.body.video_id || req.body.name || req.body.page_url;
   const videoSlug = slugify(rawSlug) || uuid();
   const existing = await getVideoBySiteAndVideoId(db, site.site_id, videoSlug);
@@ -1857,6 +1963,7 @@ app.post("/dashboard/videos", requireLogin, async (req, res) => {
     warningParam = "&warning=" + encodeURIComponent("Test mode selected, but this site has no test_event_code. Events will be logged but not forwarded.");
   }
 
+  const { provider, providerVideoId } = parseVideoSourceInfo(req.body.video_source_url);
   const id = uuid();
   await createVideo(db, {
     id,
@@ -1864,6 +1971,9 @@ app.post("/dashboard/videos", requireLogin, async (req, res) => {
     video_id: videoSlug,
     name: req.body.name || null,
     page_url: req.body.page_url || null,
+    video_source_url: req.body.video_source_url || null,
+    provider,
+    provider_video_id: providerVideoId,
     selector: req.body.selector || "video",
     enabled: req.body.enabled !== undefined,
     mode
@@ -1922,6 +2032,10 @@ app.get("/dashboard/videos/:videoDbId", requireLogin, async (req, res) => {
         <label>Page URL
           <input name="page_url" value="${video.page_url ?? ""}" required />
         </label>
+        <label>Video source URL (optional)
+          <input name="video_source_url" value="${video.video_source_url ?? ""}" />
+          <span class="muted">The actual video file or provider URL (mp4, Vimeo, YouTube, etc.). Used for identification and management.</span>
+        </label>
         <label>Video name (optional)
           <input name="name" value="${video.name ?? ""}" />
         </label>
@@ -1949,6 +2063,7 @@ app.get("/dashboard/videos/:videoDbId", requireLogin, async (req, res) => {
     <div class="card">
       <h2>Snippet</h2>
       <p class="muted">Milestones sent: Video25/50/75/95. <code>video_id</code> is passed in <code>custom_data</code>.</p>
+      <p class="muted">Detected provider: <strong>${formatVideoProvider(video.provider)}</strong>${video.provider_video_id ? ` (ID: ${video.provider_video_id})` : ""}</p>
       <pre>${snippet.replace(/</g, "&lt;")}</pre>
       <button id="copy-snippet">Copy Snippet</button>
     </div>
@@ -1994,6 +2109,13 @@ app.post("/dashboard/videos/:videoDbId", requireLogin, async (req, res) => {
     }));
   }
 
+  if (!req.body.page_url?.trim()) {
+    return res.status(400).send(renderPage({
+      title: "Missing page URL",
+      body: `<div class="card"><h1>Page URL required</h1><p class="muted">Add the page URL where the video is embedded.</p></div>`
+    }));
+  }
+
   const videoSlug = slugify(req.body.video_id) || video.video_id;
   const existing = await getVideoBySiteAndVideoId(db, site.site_id, videoSlug);
   if (existing && existing.id !== video.id) {
@@ -2011,12 +2133,16 @@ app.post("/dashboard/videos/:videoDbId", requireLogin, async (req, res) => {
     warningParam = "&warning=" + encodeURIComponent("Live mode sends production events and impacts optimization/reporting.");
   }
 
+  const { provider, providerVideoId } = parseVideoSourceInfo(req.body.video_source_url);
   await updateVideo(db, {
     id: video.id,
     site_id: site.site_id,
     video_id: videoSlug,
     name: req.body.name || null,
     page_url: req.body.page_url || null,
+    video_source_url: req.body.video_source_url || null,
+    provider,
+    provider_video_id: providerVideoId,
     selector: req.body.selector || "video",
     enabled: req.body.enabled !== undefined,
     mode
@@ -2039,6 +2165,9 @@ app.post("/dashboard/videos/:videoDbId/toggle", requireLogin, async (req, res) =
     video_id: video.video_id,
     name: video.name,
     page_url: video.page_url,
+    video_source_url: video.video_source_url,
+    provider: video.provider,
+    provider_video_id: video.provider_video_id,
     selector: video.selector,
     enabled: !video.enabled,
     mode: video.mode
@@ -2454,6 +2583,14 @@ app.post("/v/track", async (req, res) => {
       page_url: video.page_url
     }
   };
+  const inboundLogPayload = {
+    ...inboundEvent,
+    custom_data: {
+      ...inboundEvent.custom_data,
+      provider: video.provider ?? null,
+      provider_video_id: video.provider_video_id ?? null
+    }
+  };
 
   await log({
     type: "video_event_inbound",
@@ -2474,7 +2611,7 @@ app.post("/v/track", async (req, res) => {
       percent: percentValue,
       event_source_url: resolvedSourceUrl,
       status: "deduped",
-      inbound_json: JSON.stringify(sanitizePayload(inboundEvent, site.log_full_payloads === 1)),
+      inbound_json: JSON.stringify(sanitizePayload(inboundLogPayload, site.log_full_payloads === 1)),
       video_mode: mode
     });
     await log({
@@ -2492,7 +2629,7 @@ app.post("/v/track", async (req, res) => {
     ...payload,
     data: [sanitizePayload(inboundEvent, site.log_full_payloads === 1)]
   });
-  const inboundLog = JSON.stringify(sanitizePayload(inboundEvent, site.log_full_payloads === 1));
+  const inboundLog = JSON.stringify(sanitizePayload(inboundLogPayload, site.log_full_payloads === 1));
 
   if (mode === "off") {
     await insertEvent(db, {

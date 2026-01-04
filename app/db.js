@@ -64,7 +64,10 @@ export async function initDb(dbPath) {
       site_id TEXT NOT NULL,
       video_id TEXT NOT NULL,
       name TEXT,
-      page_url TEXT,
+      page_url TEXT NOT NULL,
+      video_source_url TEXT,
+      provider TEXT,
+      provider_video_id TEXT,
       selector TEXT DEFAULT 'video',
       enabled INTEGER DEFAULT 1,
       mode TEXT NOT NULL DEFAULT 'test',
@@ -113,6 +116,18 @@ export async function initDb(dbPath) {
 
   if (videoColumns.length > 0 && !videoColumnNames.has("selector")) {
     await db.exec("ALTER TABLE videos ADD COLUMN selector TEXT DEFAULT 'video'");
+  }
+
+  if (videoColumns.length > 0 && !videoColumnNames.has("video_source_url")) {
+    await db.exec("ALTER TABLE videos ADD COLUMN video_source_url TEXT");
+  }
+
+  if (videoColumns.length > 0 && !videoColumnNames.has("provider")) {
+    await db.exec("ALTER TABLE videos ADD COLUMN provider TEXT");
+  }
+
+  if (videoColumns.length > 0 && !videoColumnNames.has("provider_video_id")) {
+    await db.exec("ALTER TABLE videos ADD COLUMN provider_video_id TEXT");
   }
 
   if (videoColumns.length > 0 && !videoColumnNames.has("enabled")) {
@@ -304,12 +319,15 @@ export async function getEventById(db, eventId) {
 
 export async function createVideo(db, video) {
   await db.run(
-    "INSERT INTO videos (id, site_id, video_id, name, page_url, selector, enabled, mode, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+    "INSERT INTO videos (id, site_id, video_id, name, page_url, video_source_url, provider, provider_video_id, selector, enabled, mode, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
     video.id,
     video.site_id,
     video.video_id,
     video.name ?? null,
     video.page_url ?? null,
+    video.video_source_url ?? null,
+    video.provider ?? null,
+    video.provider_video_id ?? null,
     video.selector ?? "video",
     video.enabled ? 1 : 0,
     video.mode ?? "test"
@@ -318,11 +336,14 @@ export async function createVideo(db, video) {
 
 export async function updateVideo(db, video) {
   await db.run(
-    "UPDATE videos SET site_id = ?, video_id = ?, name = ?, page_url = ?, selector = ?, enabled = ?, mode = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+    "UPDATE videos SET site_id = ?, video_id = ?, name = ?, page_url = ?, video_source_url = ?, provider = ?, provider_video_id = ?, selector = ?, enabled = ?, mode = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
     video.site_id,
     video.video_id,
     video.name ?? null,
     video.page_url ?? null,
+    video.video_source_url ?? null,
+    video.provider ?? null,
+    video.provider_video_id ?? null,
     video.selector ?? "video",
     video.enabled ? 1 : 0,
     video.mode ?? "test",
