@@ -383,6 +383,15 @@ function renderPage({ title, body, nav = true }) {
   `;
 }
 
+function resolveOrigin(value) {
+  if (!value) return null;
+  try {
+    return new URL(String(value)).origin;
+  } catch {
+    return null;
+  }
+}
+
 function wantsJson(req) {
   if (req.path === "/admin") return false;
   const accept = req.headers.accept || "";
@@ -438,6 +447,10 @@ function slugify(value) {
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .slice(0, 64);
+}
+
+function formatForwardReason(reason) {
+  return reason ? String(reason) : "null";
 }
 
 const VIDEO_PROVIDER_LABELS = {
@@ -1503,7 +1516,7 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
             if (now - lastProgressLog < 2000) return;
             lastProgressLog = now;
             if (debug) {
-              console.log('[CAPI VT] progress', {
+              console.log('[CAPI VT] progress_heartbeat', {
                 watchedSeconds,
                 currentTime: video.currentTime,
                 duration: duration(),
@@ -1513,7 +1526,7 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
                 seeking: video.seeking
               });
             }
-            log('progress', {
+            log('progress heartbeat', {
               watchedSeconds,
               currentTime: video.currentTime,
               duration: duration(),
@@ -1557,9 +1570,7 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
 
             try {
               const trackUrl = baseUrl + '/v/track';
-              if (debug) {
-                console.log('[CAPI VT] post_track', { url: trackUrl, milestone: percent });
-              }
+              console.log('[CAPI VT] POST /v/track milestone=' + percent + ' pct=' + percentWatched() + ' ws=' + Math.round(watchedSeconds));
               log('send attempt', { milestone: percent, event_id: eventId, url: trackUrl });
               const response = await fetch(trackUrl, {
                 method: 'POST',
@@ -1576,9 +1587,9 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
               } catch (parseErr) {
                 responseBody = await response.text();
               }
-              if (debug) {
-                console.log('[CAPI VT] post_result', { status: response.status });
-              }
+              const inboundId = responseBody && typeof responseBody === 'object' ? responseBody.inbound_id : null;
+              const traceId = responseBody && typeof responseBody === 'object' ? responseBody.trace_id : null;
+              console.log('[CAPI VT] post_result status=' + response.status + ' inbound_id=' + (inboundId || 'null') + ' trace_id=' + (traceId || 'null'));
               log('/v/track response', { url: trackUrl, status: response.status, body: responseBody });
             } catch (err) {
               error('send failed', err);
@@ -1796,6 +1807,76 @@ app.get("/admin/logs", requireAuth, async (req, res) => {
   res.json({ events, errors });
 });
 
+app.get("/api/inbound/recent", requireAuth, async (req, res) => {
+  const limit = Number.parseInt(req.query.limit ?? "50", 10);
+  const safeLimit = Number.isNaN(limit) ? 50 : Math.min(Math.max(limit, 1), 200);
+  const siteKey = req.query.site_key ?? null;
+  const videoId = req.query.video_id ?? null;
+  const sinceId = Number.parseInt(req.query.since_id ?? "", 10);
+  const conditions = [];
+  const params = [];
+
+  if (siteKey) {
+    conditions.push("sites.site_key = ?");
+    params.push(siteKey);
+  }
+  if (videoId) {
+    conditions.push("events.video_id = ?");
+    params.push(videoId);
+  }
+  if (!Number.isNaN(sinceId)) {
+    conditions.push("events.id > ?");
+    params.push(sinceId);
+  }
+
+  const whereClause = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+  // Ordered newest -> oldest for consistent rendering.
+  const rows = await db.all(
+    `
+      SELECT events.id,
+        events.received_at_utc_ms,
+        events.received_at,
+        events.ip_address,
+        events.event_source_url,
+        events.video_id,
+        events.event_name,
+        events.percent,
+        events.trace_id,
+        events.user_agent,
+        events.inbound_json,
+        sites.site_key
+      FROM events
+      LEFT JOIN sites ON events.site_id = sites.site_id
+      ${whereClause}
+      ORDER BY events.id DESC
+      LIMIT ?
+    `,
+    ...params,
+    safeLimit
+  );
+
+  const mappedRows = rows.map(row => {
+    const inbound = safeJsonParse(row.inbound_json);
+    const customData = inbound?.custom_data || {};
+    return {
+      id: row.id,
+      ts: row.received_at_utc_ms ?? row.received_at ?? null,
+      ip: row.ip_address ?? null,
+      origin: resolveOrigin(row.event_source_url),
+      site_key: row.site_key ?? null,
+      video_id: row.video_id ?? null,
+      event_name: row.event_name ?? null,
+      percent: row.percent ?? null,
+      watched_seconds: customData.watch_seconds ?? null,
+      duration: customData.duration ?? null,
+      trace_id: row.trace_id ?? null,
+      user_agent: row.user_agent ?? null
+    };
+  });
+
+  res.json({ ok: true, rows: mappedRows });
+});
+
 app.get("/admin/debug/db-info", requireAuth, async (req, res) => {
   const inboundCount = await db.get("SELECT COUNT(*) as count FROM events");
   const outboundCount = await db.get("SELECT COUNT(*) as count FROM outbound_logs");
@@ -1815,19 +1896,75 @@ app.get("/admin/debug/db-info", requireAuth, async (req, res) => {
 
 app.get("/admin/debug/last-inbound", requireAuth, async (req, res) => {
   const limit = Number.parseInt(req.query.limit ?? "50", 10);
-  const safeLimit = Number.isNaN(limit) ? 50 : Math.min(Math.max(limit, 1), 500);
+  const safeLimit = Number.isNaN(limit) ? 50 : Math.min(Math.max(limit, 1), 200);
   const rows = await db.all(
-    "SELECT * FROM events ORDER BY received_at_utc_ms DESC, id DESC LIMIT ?",
+    `
+      SELECT events.id,
+        events.received_at_utc_ms,
+        events.received_at,
+        events.video_id,
+        events.event_name,
+        events.percent,
+        events.trace_id,
+        events.event_source_url,
+        events.inbound_json,
+        sites.site_key
+      FROM events
+      LEFT JOIN sites ON events.site_id = sites.site_id
+      ORDER BY events.received_at_utc_ms DESC, events.id DESC
+      LIMIT ?
+    `,
     safeLimit
   );
-  res.json(
-    rows.map(row => ({
-      ...row,
-      inbound_json: safeJsonParse(row.inbound_json),
-      outbound_json: safeJsonParse(row.outbound_json),
-      meta_body: safeJsonParse(row.meta_body)
-    }))
-  );
+  const tableRows = rows
+    .map(row => {
+      const inbound = safeJsonParse(row.inbound_json);
+      const customData = inbound?.custom_data || {};
+      return `
+        <tr>
+          <td>${escapeHtml(row.id)}</td>
+          <td>${escapeHtml(formatDate(row.received_at_utc_ms ?? row.received_at))}</td>
+          <td>${escapeHtml(row.site_key ?? "—")}</td>
+          <td>${escapeHtml(row.video_id ?? "—")}</td>
+          <td>${escapeHtml(row.event_name ?? "—")}</td>
+          <td>${escapeHtml(row.percent ?? "—")}</td>
+          <td>${escapeHtml(customData.watch_seconds ?? "—")}</td>
+          <td>${escapeHtml(row.trace_id ?? "—")}</td>
+          <td>${escapeHtml(resolveOrigin(row.event_source_url) ?? "—")}</td>
+        </tr>
+      `;
+    })
+    .join("");
+  const body = `
+    <div class="card">
+      <h1>Last inbound events</h1>
+      <p class="muted">Auto-refreshes every 2 seconds.</p>
+    </div>
+    <div class="card">
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Time</th>
+            <th>Site</th>
+            <th>Video</th>
+            <th>Event</th>
+            <th>%</th>
+            <th>Watched Seconds</th>
+            <th>Trace</th>
+            <th>Origin</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${tableRows}
+        </tbody>
+      </table>
+    </div>
+    <script>
+      setTimeout(() => window.location.reload(), 2000);
+    </script>
+  `;
+  res.send(renderPage({ title: "Last inbound events", body }));
 });
 
 app.get("/admin/debug/trace/:trace_id", requireAuth, async (req, res) => {
@@ -1985,6 +2122,108 @@ app.get("/dashboard", requireAuth, async (req, res) => {
         </tbody>
       </table>
     </div>
+    <div class="card">
+      <div class="inline">
+        <div>
+          <h2>Live Inbound</h2>
+          <p class="muted">Newest inbound tracking events (auto-refresh every 2 seconds).</p>
+        </div>
+        <div class="muted">
+          <div id="live-inbound-updated">Last updated: —</div>
+          <div>Total rows: <span id="live-inbound-count">0</span></div>
+        </div>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Time</th>
+            <th>Site Key</th>
+            <th>Video</th>
+            <th>Event</th>
+            <th>%</th>
+            <th>Watched</th>
+            <th>Duration</th>
+            <th>Trace</th>
+            <th>Origin</th>
+            <th>IP</th>
+            <th>User Agent</th>
+          </tr>
+        </thead>
+        <tbody id="live-inbound-body"></tbody>
+      </table>
+    </div>
+    <script>
+      const liveInboundBody = document.getElementById('live-inbound-body');
+      const liveInboundUpdated = document.getElementById('live-inbound-updated');
+      const liveInboundCount = document.getElementById('live-inbound-count');
+      const liveTimeZone = ${JSON.stringify(cachedTimeZone)};
+      let lastRenderedId = null;
+
+      function formatInboundTime(value) {
+        if (!value) return '—';
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) return value;
+        if (liveTimeZone) {
+          return date.toLocaleString('en-US', { timeZone: liveTimeZone });
+        }
+        return date.toLocaleString();
+      }
+
+      function createCell(text, className) {
+        const cell = document.createElement('td');
+        if (className) cell.className = className;
+        cell.textContent = text === null || text === undefined || text === '' ? '—' : String(text);
+        return cell;
+      }
+
+      function renderInboundRow(row) {
+        const tr = document.createElement('tr');
+        tr.appendChild(createCell(row.id));
+        tr.appendChild(createCell(formatInboundTime(row.ts)));
+        tr.appendChild(createCell(row.site_key));
+        tr.appendChild(createCell(row.video_id));
+        tr.appendChild(createCell(row.event_name));
+        tr.appendChild(createCell(row.percent));
+        tr.appendChild(createCell(row.watched_seconds));
+        tr.appendChild(createCell(row.duration));
+        tr.appendChild(createCell(row.trace_id));
+        tr.appendChild(createCell(row.origin));
+        tr.appendChild(createCell(row.ip));
+        const uaCell = createCell(row.user_agent);
+        uaCell.classList.add('truncate');
+        tr.appendChild(uaCell);
+        return tr;
+      }
+
+      function updateCounts() {
+        liveInboundCount.textContent = String(liveInboundBody.children.length);
+      }
+
+      async function loadInbound() {
+        const params = new URLSearchParams({ limit: '50' });
+        if (lastRenderedId) params.set('since_id', lastRenderedId);
+        const response = await fetch('/api/inbound/recent?' + params.toString());
+        const payload = await response.json();
+        if (!payload || !payload.ok) return;
+        const rows = payload.rows || [];
+        if (rows.length) {
+          for (let i = rows.length - 1; i >= 0; i -= 1) {
+            const row = rows[i];
+            const tr = renderInboundRow(row);
+            liveInboundBody.prepend(tr);
+            if (!lastRenderedId || row.id > lastRenderedId) {
+              lastRenderedId = row.id;
+            }
+          }
+          updateCounts();
+        }
+        liveInboundUpdated.textContent = 'Last updated: ' + new Date().toLocaleTimeString();
+      }
+
+      loadInbound();
+      setInterval(loadInbound, 2000);
+    </script>
   `;
 
   res.send(renderPage({ title: "Dashboard", body }));
@@ -3643,6 +3882,7 @@ app.post("/v/track", publicCors, async (req, res) => {
       provider_video_id: video?.provider_video_id ?? null
     }
   };
+  const origin = resolveOrigin(resolvedSourceUrl);
 
   let inboundId;
   const receivedAtUtcMs = Date.now();
@@ -3671,6 +3911,10 @@ app.post("/v/track", publicCors, async (req, res) => {
     await log({ type: "error", message: "failed to persist inbound event", error: error.toString() });
     return res.status(500).json({ ok: false, error: "failed to persist inbound event" });
   }
+
+  console.log(
+    `[TRACK] inbound_id=${inboundId} site=${site.site_key} video=${video_id} event=${eventName} pct=${percentValue} ws=${watch_seconds ?? "—"} trace=${traceId} origin=${origin ?? "—"}`
+  );
 
   await log({
     type: "video_event_inbound",
@@ -3702,6 +3946,9 @@ app.post("/v/track", publicCors, async (req, res) => {
         reason: "deduped"
       });
       await updateInboundOutbound(db, inboundId, { outboundResult: "skipped", outboundReason: "deduped" });
+      console.log(
+        `[FORWARD] inbound_id=${inboundId} trace=${traceId} ok=false reason=${formatForwardReason("deduped")}`
+      );
       await log({
         type: "dedup",
         message: "duplicate video event received",
@@ -3844,6 +4091,9 @@ app.post("/v/track", publicCors, async (req, res) => {
   }
 
   await cleanupRetention(db, await getSettingNumber("log_retention_hours", 168));
+  console.log(
+    `[FORWARD] inbound_id=${inboundId} trace=${traceId} ok=${outboundResult === "sent"} reason=${formatForwardReason(outboundReason)}`
+  );
   await log({
     type: "v/track",
     message: `[v/track] trace=${traceId} inbound_id=${inboundId} video=${video_id} percent=${percentValue} saved_at=${receivedAtUtcMs} forward=${outboundResult} reason=${outboundReason || "none"}`
