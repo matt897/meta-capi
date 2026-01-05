@@ -245,7 +245,7 @@ const publicCors = cors({
     return callback(null, false);
   },
   methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "X-Site-Key"],
+  allowedHeaders: ["Content-Type", "X-Site-Key", "X-Meta-Test-Event-Code"],
   credentials: false,
   optionsSuccessStatus: 204
 });
@@ -304,6 +304,24 @@ async function logMetaSend({ site, mode, testEventCode, status, responseBody }) 
     events_received: responseBody?.events_received ?? null,
     meta_status: status
   });
+}
+
+function normalizeTestEventCode(value) {
+  if (value === undefined || value === null) return null;
+  const trimmed = String(value).trim();
+  return trimmed ? trimmed : null;
+}
+
+function getTestEventCode(req, body) {
+  const bodyCode = normalizeTestEventCode(body?.test_event_code);
+  if (bodyCode) return bodyCode;
+  const queryCode = normalizeTestEventCode(req.query?.test_event_code);
+  if (queryCode) return queryCode;
+  return normalizeTestEventCode(req.get("x-meta-test-event-code") || req.headers["x-meta-test-event-code"]);
+}
+
+function isTestEvent(req, body) {
+  return Boolean(getTestEventCode(req, body));
 }
 
 function escapeHtml(value) {
@@ -3840,6 +3858,10 @@ app.post("/v/track", publicCors, async (req, res) => {
 
   const video = await getVideoBySiteAndVideoId(db, site.site_id, video_id);
   const mode = video ? normalizeVideoMode(video.mode) : "off";
+  const inboundTestEventCode = getTestEventCode(req, req.body);
+  const isInboundTestEvent = isTestEvent(req, req.body);
+  const testEventCode = inboundTestEventCode || (mode === "test" ? site.test_event_code : null);
+  const isTest = isInboundTestEvent || Boolean(testEventCode);
   const percentValue = Number.parseInt(percent, 10);
   const eventName = Number.isFinite(percentValue) ? `Video${percentValue}` : "Video";
   const resolvedSourceUrl = event_source_url || video?.page_url || resolveEventSourceUrl({}, req) || "";
@@ -3900,6 +3922,7 @@ app.post("/v/track", publicCors, async (req, res) => {
       status: "received",
       inbound_json: JSON.stringify(sanitizePayload(inboundLogPayload, site.log_full_payloads === 1)),
       video_mode: mode,
+      test_event_code: testEventCode,
       user_agent: req.get("user-agent"),
       ip_address: getClientIp(req),
       received_at_utc_ms: receivedAtUtcMs,
@@ -3925,10 +3948,12 @@ app.post("/v/track", publicCors, async (req, res) => {
     inbound_id: inboundId
   });
 
+  let deduped = false;
   const dedupTtlHours = await getSettingNumber("dedup_ttl_hours", 48);
-  if (eventId) {
+  if (eventId && !isTest) {
     const seen = await hasRecentEventId(db, site.site_id, eventId, dedupTtlHours);
     if (seen) {
+      deduped = true;
       const duplicateCountRow = await db.get(
         "SELECT COUNT(*) as count FROM events WHERE site_id = ? AND event_id = ?",
         site.site_id,
@@ -3959,6 +3984,9 @@ app.post("/v/track", publicCors, async (req, res) => {
         type: "v/track",
         message: `[v/track] trace=${traceId} inbound_id=${inboundId} video=${video_id} percent=${percentValue} saved_at=${receivedAtUtcMs} forward=skipped reason=deduped`
       });
+      console.log(
+        `[TRACK] inbound_id=${inboundId} test=${isTest} test_code=${testEventCode ?? "null"} gated=false deduped=true forwarded=false reason=deduped`
+      );
       await cleanupRetention(db, await getSettingNumber("log_retention_hours", 168));
       return res.json({
         ok: true,
@@ -3974,7 +4002,7 @@ app.post("/v/track", publicCors, async (req, res) => {
 
   const outboundPayload = {
     data: [inboundEvent],
-    ...(mode === "test" && site.test_event_code ? { test_event_code: site.test_event_code } : {})
+    ...(testEventCode ? { test_event_code: testEventCode } : {})
   };
   const outboundLogPayload = JSON.stringify({
     ...outboundPayload,
@@ -3987,18 +4015,19 @@ app.post("/v/track", publicCors, async (req, res) => {
   let outboundReason = null;
   let forwarded = false;
   let outboundLogged = false;
+  let gated = false;
 
   if (!video) {
     outboundReason = "video_not_found";
-  } else if (!video.enabled) {
+  } else if (!isTest && !video.enabled) {
     outboundReason = "video_disabled";
   } else if (!shouldSendToMeta) {
     outboundReason = site.dry_run ? "dry_run" : "send_disabled";
-  } else if (mode === "off") {
+  } else if (!isTest && mode === "off") {
     outboundReason = "video_mode_off";
   } else if (!site.pixel_id || !accessToken) {
     outboundReason = "missing_meta_credentials";
-  } else if (mode === "test" && !site.test_event_code) {
+  } else if (!testEventCode && mode === "test") {
     outboundReason = "missing_test_event_code";
   } else if (!hasMinimumUserData(userData)) {
     outboundReason = "insufficient_user_data";
@@ -4013,6 +4042,9 @@ app.post("/v/track", publicCors, async (req, res) => {
       outboundReason = response.ok ? null : status >= 500 ? "meta_5xx" : "meta_4xx";
       forwarded = response.ok;
 
+      console.log(
+        `[META] inbound_id=${inboundId} test=${isTest} status=${status} trace_id=${traceId} error=null`
+      );
       await insertOutboundLog(db, {
         inbound_id: inboundId,
         mode_used: mode,
@@ -4050,11 +4082,14 @@ app.post("/v/track", publicCors, async (req, res) => {
       await logMetaSend({
         site,
         mode,
-        testEventCode: mode === "test" ? site.test_event_code : null,
+        testEventCode: testEventCode ?? null,
         status,
         responseBody: body
       });
     } catch (err) {
+      console.log(
+        `[META] inbound_id=${inboundId} test=${isTest} status=null trace_id=${traceId} error=${err.toString()}`
+      );
       outboundResult = "failed";
       outboundReason = "exception";
       forwarded = false;
@@ -4091,8 +4126,12 @@ app.post("/v/track", publicCors, async (req, res) => {
   }
 
   await cleanupRetention(db, await getSettingNumber("log_retention_hours", 168));
+  gated = !isTest && ["video_not_found", "video_disabled", "video_mode_off"].includes(outboundReason);
   console.log(
     `[FORWARD] inbound_id=${inboundId} trace=${traceId} ok=${outboundResult === "sent"} reason=${formatForwardReason(outboundReason)}`
+  );
+  console.log(
+    `[TRACK] inbound_id=${inboundId} test=${isTest} test_code=${testEventCode ?? "null"} gated=${gated} deduped=${deduped} forwarded=${forwarded} reason=${outboundReason ?? "null"}`
   );
   await log({
     type: "v/track",
@@ -4150,6 +4189,13 @@ app.post("/collect", publicCors, async (req, res) => {
   }
 
   const inboundEvent = { ...req.body };
+  const inboundTestEventCode = getTestEventCode(req, inboundEvent);
+  const isInboundTestEvent = isTestEvent(req, inboundEvent);
+  const testEventCode = inboundTestEventCode || site.test_event_code || null;
+  const isTest = isInboundTestEvent || Boolean(testEventCode);
+  if ("test_event_code" in inboundEvent) {
+    delete inboundEvent.test_event_code;
+  }
 
   if (!inboundEvent.event_name || !inboundEvent.event_time) {
     await insertError(db, { type: "validation", site_id: site.site_id, message: "missing event_name or event_time" });
@@ -4200,13 +4246,14 @@ app.post("/collect", publicCors, async (req, res) => {
     event_id: eventId,
     event_name: inboundEvent.event_name,
     event_source_url: inboundEvent.event_source_url,
+    test_event_code: testEventCode,
     event_time_client: eventTimeClientValue,
     received_at_utc_ms: receivedAtUtcMs
   };
 
   const dedupTtlHours = await getSettingNumber("dedup_ttl_hours", 48);
 
-  if (eventId) {
+  if (eventId && !isTest) {
     const seen = await hasRecentEventId(db, site.site_id, eventId, dedupTtlHours);
     if (seen) {
       await insertEvent(db, {
@@ -4227,7 +4274,7 @@ app.post("/collect", publicCors, async (req, res) => {
 
   const payload = {
     data: [inboundEvent],
-    test_event_code: site.test_event_code
+    ...(testEventCode ? { test_event_code: testEventCode } : {})
   };
 
   const accessToken = resolveAccessToken(site);
@@ -4325,7 +4372,7 @@ app.post("/collect", publicCors, async (req, res) => {
     await logMetaSend({
       site,
       mode: "live",
-      testEventCode: site.test_event_code,
+      testEventCode: testEventCode ?? null,
       status,
       responseBody: body
     });
