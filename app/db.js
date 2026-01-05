@@ -41,6 +41,8 @@ export async function initDb(dbPath) {
       video_mode TEXT,
       user_agent TEXT,
       ip_address TEXT,
+      trace_id TEXT,
+      event_time_client INTEGER,
       received_at TEXT DEFAULT CURRENT_TIMESTAMP,
       received_at_utc_ms INTEGER,
       last_seen_at TEXT,
@@ -107,6 +109,20 @@ export async function initDb(dbPath) {
     );
   `);
 
+  async function addColumn(table, colDef) {
+    try {
+      await db.exec(`ALTER TABLE ${table} ADD COLUMN ${colDef}`);
+    } catch (error) {
+      if (!/duplicate column name/i.test(error?.message ?? "")) {
+        throw error;
+      }
+    }
+  }
+
+  await addColumn("events", "trace_id TEXT");
+  await addColumn("events", "event_time_client INTEGER");
+  await addColumn("events", "test_event_code TEXT");
+
   const columns = await db.all("PRAGMA table_info(sites)");
   const columnNames = new Set(columns.map(column => column.name));
 
@@ -159,12 +175,6 @@ export async function initDb(dbPath) {
   }
   if (!eventColumnNames.has("received_at_utc_ms")) {
     await db.exec("ALTER TABLE events ADD COLUMN received_at_utc_ms INTEGER");
-  }
-  if (!eventColumnNames.has("trace_id")) {
-    await db.exec("ALTER TABLE events ADD COLUMN trace_id TEXT");
-  }
-  if (!eventColumnNames.has("event_time_client")) {
-    await db.exec("ALTER TABLE events ADD COLUMN event_time_client INTEGER");
   }
   if (!eventColumnNames.has("received_at_utc_ms")) {
     eventColumnNames.add("received_at_utc_ms");
@@ -248,6 +258,8 @@ export async function initDb(dbPath) {
     await db.exec("ALTER TABLE videos ADD COLUMN updated_at TEXT");
     await db.run("UPDATE videos SET updated_at = created_at WHERE updated_at IS NULL");
   }
+
+  console.log("[DB] migrations applied (safe/ignored if already present)");
 
   return db;
 }
