@@ -1214,14 +1214,16 @@ app.get("/sdk/ping", publicCors, async (req, res) => {
     site_key: siteKey,
     video_id: videoId,
     origin: req.get("origin") || null,
-    referer: req.get("referer") || null
+    referer: req.get("referer") || null,
+    ua: req.get("user-agent") || null
   });
   await log({
     type: "sdk_ping",
     site_key: siteKey,
     video_id: videoId,
     origin: req.get("origin") || null,
-    referer: req.get("referer") || null
+    referer: req.get("referer") || null,
+    ua: req.get("user-agent") || null
   });
   res.json({ ok: true });
 });
@@ -1241,7 +1243,6 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
   res.send(`
     (function() {
       window.__CAPI_VT_EXEC__ = (window.__CAPI_VT_EXEC__ || 0) + 1;
-      console.log("[CAPI VT] executed", { count: window.__CAPI_VT_EXEC__ });
       const SDK_VERSION = "0.1.0";
       const DEBUG_QUERY_VALUE = new URLSearchParams(window.location.search).get('capi_debug');
       const RESET_QUERY_VALUE = new URLSearchParams(window.location.search).get('capi_reset');
@@ -1368,6 +1369,11 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
         const siteKey = script.dataset.siteKey;
         const videoId = script.dataset.videoId;
         const selector = script.dataset.selector || 'video';
+        const datasetLog = {
+          videoId,
+          selector,
+          hasSiteKey: Boolean(siteKey)
+        };
         if (!videoId) {
           console.warn('[CAPI VideoTracker] missing data-video-id; tracker disabled');
           return;
@@ -1377,18 +1383,18 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
           return;
         }
 
-        const debug = parseDebugValue(script.dataset.debug) || parseDebugValue(DEBUG_QUERY_VALUE);
+        const debug = parseDebugValue(script.dataset.debug)
+          || parseDebugValue(DEBUG_QUERY_VALUE)
+          || parseDebugValue(window.CAPI_VIDEO_DEBUG);
         const { log, warn, error } = createLogger(debug);
         const warnOnce = createWarnOnce();
 
         if (debug) {
-          console.log('[CAPI VT] debug enabled', {
-            dataset: { ...script.dataset },
-            pageUrl: window.location.href
-          });
+          console.log('[CAPI VT] init', { version: SDK_VERSION });
+          console.log('[CAPI VT] dataset', datasetLog);
         }
 
-        log('loaded', {
+        log('script loaded', {
           version: SDK_VERSION,
           videoId,
           selector,
@@ -1414,7 +1420,7 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
             }
             const configJson = await configRes.json();
             config = { ...defaultConfig, ...configJson };
-            log('config response', config);
+            log('config fetched', config);
           } catch (configErr) {
             error('config fetch failed; using defaults', configErr);
             config = defaultConfig;
@@ -1424,17 +1430,35 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
             warnOnce('tracking-disabled', 'tracking disabled by config', config);
             return;
           }
+          if (debug) {
+            console.log('[CAPI VT] config', {
+              enabled: config.enabled,
+              mode: config.mode,
+              milestones: config.milestones
+            });
+          }
 
           const milestones = (config.milestones || defaultConfig.milestones).slice().sort((a, b) => a - b);
           const video = await findVideoElement(selector, log, warn, error, warnOnce);
           if (!video) return;
+          if (debug) {
+            console.log('[CAPI VT] video_found', {
+              paused: video.paused,
+              currentTime: video.currentTime,
+              duration: video.duration,
+              visibilityState: document.visibilityState
+            });
+          }
 
           try {
             log('pinging sdk', { videoId });
-            fetch(
+            const pingResponse = await fetch(
               baseUrl + '/sdk/ping?site_key=' + encodeURIComponent(siteKey) + '&video_id=' + encodeURIComponent(videoId),
               { method: 'GET', keepalive: true }
             );
+            if (debug) {
+              console.log('[CAPI VT] ping', { status: pingResponse.status });
+            }
           } catch (pingErr) {
             warn('sdk ping failed', pingErr);
           }
@@ -1478,6 +1502,17 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
             const now = Date.now();
             if (now - lastProgressLog < 2000) return;
             lastProgressLog = now;
+            if (debug) {
+              console.log('[CAPI VT] progress', {
+                watchedSeconds,
+                currentTime: video.currentTime,
+                duration: duration(),
+                percent: percentWatched(),
+                visibilityState: document.visibilityState,
+                paused: video.paused,
+                seeking: video.seeking
+              });
+            }
             log('progress', {
               watchedSeconds,
               currentTime: video.currentTime,
@@ -1492,6 +1527,13 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
             fired.add(percent);
             updateFiredStorage();
             const eventId = await sha256Hex(videoId + '|' + percent + '|' + sessionId);
+            if (debug) {
+              console.log('[CAPI VT] milestone', {
+                milestone: percent,
+                percent: percentWatched(),
+                event_id: eventId
+              });
+            }
             log('milestone fired', {
               milestone: percent,
               event_id: eventId,
@@ -1515,6 +1557,9 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
 
             try {
               const trackUrl = baseUrl + '/v/track';
+              if (debug) {
+                console.log('[CAPI VT] post_track', { url: trackUrl, milestone: percent });
+              }
               log('send attempt', { milestone: percent, event_id: eventId, url: trackUrl });
               const response = await fetch(trackUrl, {
                 method: 'POST',
@@ -1531,7 +1576,10 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
               } catch (parseErr) {
                 responseBody = await response.text();
               }
-              log('send response', { url: trackUrl, status: response.status, body: responseBody });
+              if (debug) {
+                console.log('[CAPI VT] post_result', { status: response.status });
+              }
+              log('/v/track response', { url: trackUrl, status: response.status, body: responseBody });
             } catch (err) {
               error('send failed', err);
             }
@@ -1554,7 +1602,8 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
               lastTime = currentTime;
               return;
             }
-            if (video.paused || video.seeking || document.hidden) {
+            const isVisible = document.visibilityState ? document.visibilityState === 'visible' : !document.hidden;
+            if (video.paused || video.seeking || !isVisible) {
               lastTime = currentTime;
               return;
             }
@@ -1572,7 +1621,10 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
           function startLoop() {
             if (timerId) return;
             lastTime = video.currentTime || lastTime || 0;
-            log('loop start', { currentTime: lastTime, duration: duration() });
+            if (debug) {
+              console.log('[CAPI VT] loop_start');
+            }
+            log('loop started', { currentTime: lastTime, duration: duration() });
             timerId = setInterval(() => {
               sampleTick('interval');
             }, tickIntervalMs);
@@ -1582,11 +1634,17 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
             if (!timerId) return;
             clearInterval(timerId);
             timerId = null;
+            if (debug) {
+              console.log('[CAPI VT] loop_stop');
+            }
             log('loop stop', {});
           }
 
           video.addEventListener('loadedmetadata', () => {
             log('loadedmetadata', { duration: video.duration });
+            if (!video.paused && !video.ended) {
+              startLoop();
+            }
           });
 
           setTimeout(() => {
@@ -1616,7 +1674,7 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
             stopLoop();
           });
 
-          if (!video.paused && !video.seeking && (video.currentTime || 0) < Math.max(0, duration() - 0.25)) {
+          if (!video.paused && !video.ended) {
             startLoop();
           }
         } catch (err) {
