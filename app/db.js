@@ -29,6 +29,7 @@ export async function initDb(dbPath) {
       type TEXT,
       event_id TEXT,
       event_name TEXT,
+      test_event_code TEXT,
       video_id TEXT,
       percent INTEGER,
       event_source_url TEXT,
@@ -126,6 +127,10 @@ export async function initDb(dbPath) {
 
   if (!eventColumnNames.has("video_id")) {
     await db.exec("ALTER TABLE events ADD COLUMN video_id TEXT");
+  }
+
+  if (!eventColumnNames.has("test_event_code")) {
+    await db.exec("ALTER TABLE events ADD COLUMN test_event_code TEXT");
   }
 
   if (!eventColumnNames.has("percent")) {
@@ -352,11 +357,12 @@ export async function getSiteByKey(db, siteKey) {
 export async function insertEvent(db, event) {
   const receivedAtUtcMs = event.received_at_utc_ms ?? Date.now();
   const result = await db.run(
-    "INSERT INTO events (site_id, type, event_id, event_name, video_id, percent, event_source_url, status, inbound_json, outbound_json, meta_status, meta_body, video_mode, user_agent, ip_address, received_at, received_at_utc_ms, trace_id, event_time_client, last_seen_at, duplicate_count, outbound_result, outbound_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?, ?, ?, ?, ?)",
+    "INSERT INTO events (site_id, type, event_id, event_name, test_event_code, video_id, percent, event_source_url, status, inbound_json, outbound_json, meta_status, meta_body, video_mode, user_agent, ip_address, received_at, received_at_utc_ms, trace_id, event_time_client, last_seen_at, duplicate_count, outbound_result, outbound_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?, ?, ?, ?, ?, ?)",
     event.site_id,
     event.type ?? null,
     event.event_id ?? null,
     event.event_name ?? null,
+    event.test_event_code ?? null,
     event.video_id ?? null,
     event.percent ?? null,
     event.event_source_url ?? null,
