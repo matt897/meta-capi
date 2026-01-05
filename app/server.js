@@ -78,6 +78,24 @@ app.use(
   })
 );
 app.use(express.urlencoded({ extended: true }));
+const REQUEST_LOG_PATHS = new Set(["/sdk/config", "/sdk/ping", "/v/track"]);
+app.use((req, res, next) => {
+  if (!REQUEST_LOG_PATHS.has(req.path)) {
+    next();
+    return;
+  }
+  res.on("finish", () => {
+    const body = req.body && typeof req.body === "object" ? req.body : {};
+    console.log("[REQ]", req.method, req.path, res.statusCode, {
+      origin: req.get("origin") || null,
+      referer: req.get("referer") || null,
+      userAgent: req.get("user-agent") || null,
+      hasSiteKey: Boolean(req.headers["x-site-key"]),
+      bodyKeys: Object.keys(body || {})
+    });
+  });
+  next();
+});
 
 const PORT = process.env.PORT || 3000;
 const DEFAULT_ADMIN_USER = process.env.ADMIN_USER || process.env.DEFAULT_ADMIN_USER || "admin";
@@ -1192,6 +1210,12 @@ app.get("/sdk/config", publicCors, async (req, res) => {
 app.get("/sdk/ping", publicCors, async (req, res) => {
   const siteKey = req.query.site_key ?? null;
   const videoId = req.query.video_id ?? null;
+  console.log("[PING]", {
+    site_key: siteKey,
+    video_id: videoId,
+    origin: req.get("origin") || null,
+    referer: req.get("referer") || null
+  });
   await log({
     type: "sdk_ping",
     site_key: siteKey,
@@ -1216,6 +1240,8 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
   });
   res.send(`
     (function() {
+      window.__CAPI_VT_EXEC__ = (window.__CAPI_VT_EXEC__ || 0) + 1;
+      console.log("[CAPI VT] executed", { count: window.__CAPI_VT_EXEC__ });
       const SDK_VERSION = "0.1.0";
       const DEBUG_QUERY_VALUE = new URLSearchParams(window.location.search).get('capi_debug');
       const RESET_QUERY_VALUE = new URLSearchParams(window.location.search).get('capi_reset');
@@ -1285,7 +1311,9 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
       }
 
       function parseDebugValue(value) {
-        return value === '1' || value === 'true';
+        if (!value) return false;
+        const normalized = String(value).toLowerCase();
+        return normalized === '1' || normalized === 'true';
       }
 
       function getPersistedMilestones(storageKey) {
@@ -1353,6 +1381,13 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
         const { log, warn, error } = createLogger(debug);
         const warnOnce = createWarnOnce();
 
+        if (debug) {
+          console.log('[CAPI VT] debug enabled', {
+            dataset: { ...script.dataset },
+            pageUrl: window.location.href
+          });
+        }
+
         log('loaded', {
           version: SDK_VERSION,
           videoId,
@@ -1413,7 +1448,7 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
           let lastProgressLog = 0;
           let timerId = null;
 
-          if (debug && RESET_QUERY_VALUE === '1') {
+          if (RESET_QUERY_VALUE === '1') {
             try {
               localStorage.removeItem(firedStorageKey);
               fired.clear();
@@ -1456,13 +1491,13 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
             if (fired.has(percent)) return;
             fired.add(percent);
             updateFiredStorage();
+            const eventId = await sha256Hex(videoId + '|' + percent + '|' + sessionId);
             log('milestone fired', {
               milestone: percent,
+              event_id: eventId,
               watchedSeconds,
               duration: duration()
             });
-
-            const eventId = await sha256Hex(videoId + '|' + percent + '|' + sessionId);
             const payload = {
               video_id: videoId,
               percent: percent,
@@ -1479,8 +1514,9 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
             if (fbclid) payload.fbclid = fbclid;
 
             try {
-              log('send attempt', { milestone: percent, event_id: eventId });
-              const response = await fetch(baseUrl + '/v/track', {
+              const trackUrl = baseUrl + '/v/track';
+              log('send attempt', { milestone: percent, event_id: eventId, url: trackUrl });
+              const response = await fetch(trackUrl, {
                 method: 'POST',
                 headers: {
                   'content-type': 'application/json',
@@ -1489,14 +1525,13 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
                 body: JSON.stringify(payload),
                 keepalive: true
               });
-              log('send response', { status: response.status });
+              let responseBody = null;
               try {
-                const json = await response.clone().json();
-                log('send body', json);
+                responseBody = await response.clone().json();
               } catch (parseErr) {
-                const text = await response.text();
-                log('send body', text);
+                responseBody = await response.text();
               }
+              log('send response', { url: trackUrl, status: response.status, body: responseBody });
             } catch (err) {
               error('send failed', err);
             }
@@ -1559,12 +1594,6 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
               warnOnce('duration-invalid', 'duration still invalid; milestones may not fire', { duration: duration() });
             }
           }, 5000);
-
-          video.addEventListener('timeupdate', () => {
-            if (!timerId) {
-              sampleTick('timeupdate');
-            }
-          });
 
           video.addEventListener('playing', () => {
             startLoop();
@@ -3483,6 +3512,12 @@ app.get("/debug/pipeline", async (req, res) => {
 
 app.options("/v/track", publicCors);
 app.post("/v/track", publicCors, async (req, res) => {
+  console.log("[TRACK HIT]", {
+    hasSiteKey: Boolean(req.headers["x-site-key"] || req.body?.site_key),
+    bodyKeys: Object.keys(req.body || {}),
+    video_id: req.body?.video_id ?? null,
+    percent: req.body?.percent ?? null
+  });
   const siteKey = req.headers["x-site-key"] || req.body?.site_key;
   const site = siteKey ? await getSiteByKey(db, siteKey) : null;
 
