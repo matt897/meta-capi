@@ -39,7 +39,6 @@ import {
   listEvents,
   listVideos,
   listRecentErrors,
-  listRecentEventsForError,
   listSettings,
   markInboundDuplicate,
   rotateSiteKey,
@@ -331,6 +330,13 @@ function escapeHtml(value) {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
+}
+
+function truncateText(value, maxLength) {
+  if (value === null || value === undefined) return "—";
+  const stringValue = String(value);
+  if (stringValue.length <= maxLength) return stringValue;
+  return `${stringValue.slice(0, maxLength - 1)}…`;
 }
 
 function encryptToken(value) {
@@ -978,17 +984,6 @@ async function sendToMeta({ url, payload, retryCount }) {
 
   if (lastError) throw lastError;
   throw new Error("Unknown Meta API error");
-}
-
-function getErrorSuggestion(type) {
-  const suggestions = {
-    auth: "Check the site key or admin credentials and confirm access tokens are valid.",
-    validation: "Ensure event_name, event_time, and user_data fields match Meta requirements.",
-    meta_4xx: "Meta rejected the payload. Verify pixel ID, access token, and required fields.",
-    meta_5xx: "Meta is responding with server errors. Retry later or reduce request volume.",
-    network: "Gateway could not reach Meta. Check outbound connectivity and retry settings."
-  };
-  return suggestions[type] || "Review the error details and recent events for context.";
 }
 
 async function sendTestEvent({ site, eventType, overrides }) {
@@ -1825,6 +1820,16 @@ app.get("/admin/logs", requireAuth, async (req, res) => {
   res.json({ events, errors });
 });
 
+app.get("/api/errors/recent", requireAuth, async (req, res) => {
+  const limit = Number.parseInt(req.query.limit ?? "50", 10);
+  const safeLimit = Number.isNaN(limit) ? 50 : Math.min(Math.max(limit, 1), 200);
+  const type = req.query.type ? String(req.query.type) : "";
+  const rows = type
+    ? await listErrors(db, { type, limit: safeLimit })
+    : await listRecentErrors(db, safeLimit);
+  res.json({ ok: true, rows });
+});
+
 app.get("/api/inbound/recent", requireAuth, async (req, res) => {
   const limit = Number.parseInt(req.query.limit ?? "50", 10);
   const safeLimit = Number.isNaN(limit) ? 50 : Math.min(Math.max(limit, 1), 200);
@@ -2072,6 +2077,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
   const deduped24h = await countDedupedSince(db, 24);
   const dedupRate = events24h ? Math.round((deduped24h / events24h) * 100) : 0;
   const recentEvents = await listEvents(db, { limit: 10 });
+  const recentErrors = await listRecentErrors(db, 10);
   const sites = await getSites(db);
   const skippedCount = await db.get(
     "SELECT COUNT(*) as count FROM events WHERE outbound_result = 'skipped' AND created_at > datetime('now', '-24 hours')"
@@ -2105,6 +2111,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
       <div class="card">
         <h3>Errors (24h)</h3>
         <p class="metric">${errors24h}</p>
+        <a href="/dashboard/errors">View errors</a>
       </div>
       <div class="card">
         <h3>Approx Dedup Rate</h3>
@@ -2136,6 +2143,33 @@ app.get("/dashboard", requireAuth, async (req, res) => {
             </tr>
           `
             )
+            .join("")}
+        </tbody>
+      </table>
+      <h3>Recent errors</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Type</th>
+            <th>Message</th>
+            <th>Site</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${recentErrors
+            .map(error => {
+              const message = error.message ?? "—";
+              const truncated = truncateText(message, 140);
+              return `
+            <tr>
+              <td>${formatDate(error.created_at)}</td>
+              <td>${escapeHtml(error.type ?? "—")}</td>
+              <td title="${escapeHtml(message)}">${escapeHtml(truncated)}</td>
+              <td>${escapeHtml(error.site_name ?? "—")}</td>
+            </tr>
+          `;
+            })
             .join("")}
         </tbody>
       </table>
@@ -3601,55 +3635,70 @@ app.get("/dashboard/events/:eventId", requireAuth, async (req, res) => {
 });
 
 app.get("/dashboard/errors", requireAuth, async (req, res) => {
-  const selectedType = req.query.type;
+  const selectedType = req.query.type ?? "";
   const groups = await listErrorGroups(db);
-  let detailHtml = "<p class=\"muted\">Select an error type to inspect details.</p>";
+  const limit = 50;
+  const errors = selectedType
+    ? await listErrors(db, { type: selectedType, limit })
+    : await listRecentErrors(db, limit);
 
-  if (selectedType) {
-    const errors = await listErrors(db, { type: selectedType, limit: 10 });
-    const relatedEvents = await listRecentEventsForError(db, selectedType, 5);
-    const latest = errors[0];
-
-    detailHtml = `
-      <div class="card">
-        <h2>${selectedType} errors</h2>
-        <p class="muted">${getErrorSuggestion(selectedType)}</p>
-        <h3>Latest response</h3>
-        <pre>${JSON.stringify({ status: latest?.meta_status, body: latest?.meta_body }, null, 2)}</pre>
-        <h3>Recent events</h3>
-        <ul>
-          ${relatedEvents
-            .map(
-              event => `
-            <li>
-              <strong>${event.event_name ?? "—"}</strong> (${event.status}) – ${event.site_name ?? "Unknown site"} – ${formatDate(event.created_at)}
-            </li>
-          `
-            )
-            .join("")}
-        </ul>
-      </div>
-    `;
-  }
+  const typeOptions = [
+    `<option value="" ${selectedType ? "" : "selected"}>All types</option>`,
+    ...groups.map(group => {
+      const isSelected = group.type === selectedType ? "selected" : "";
+      return `<option value="${escapeHtml(group.type)}" ${isSelected}>${escapeHtml(group.type)} (${group.count})</option>`;
+    })
+  ].join("");
 
   const body = `
     <div class="card">
       <h1>Errors</h1>
-      <p class="muted">Grouped by type with suggested resolution.</p>
+      <p class="muted">Inspect recent errors with message context.</p>
     </div>
-    <div class="grid">
-      ${groups
-        .map(
-          group => `
-        <a class="card link-card" href="/dashboard/errors?type=${group.type}">
-          <h3>${group.type}</h3>
-          <p class="metric">${group.count}</p>
-        </a>
-      `
-        )
-        .join("")}
+    <div class="card">
+      <form method="get" action="/dashboard/errors" class="form-grid">
+        <label>Error type
+          <select name="type">
+            ${typeOptions}
+          </select>
+        </label>
+        <button type="submit">Filter</button>
+      </form>
     </div>
-    ${detailHtml}
+    <div class="card">
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Type</th>
+            <th>Site</th>
+            <th>Message</th>
+            <th>Event</th>
+            <th>Meta Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${errors
+            .map(error => {
+              const message = error.message ?? "—";
+              const eventLink = error.event_db_id
+                ? `<a href="/dashboard/events/${error.event_db_id}">${escapeHtml(error.event_db_id)}</a>`
+                : "—";
+              return `
+            <tr>
+              <td>${formatDate(error.created_at)}</td>
+              <td>${escapeHtml(error.type ?? "—")}</td>
+              <td>${escapeHtml(error.site_name ?? "—")}</td>
+              <td title="${escapeHtml(message)}">${escapeHtml(message)}</td>
+              <td>${eventLink}</td>
+              <td>${escapeHtml(error.meta_status ?? "—")}</td>
+            </tr>
+          `;
+            })
+            .join("")}
+        </tbody>
+      </table>
+    </div>
   `;
 
   res.send(renderPage({ title: "Errors", body }));
@@ -3932,6 +3981,25 @@ app.post("/v/track", publicCors, async (req, res) => {
   } catch (error) {
     await insertError(db, { type: "db", site_id: site.site_id, event_id: eventId, message: error.toString() });
     await log({ type: "error", message: "failed to persist inbound event", error: error.toString() });
+    console.error("[v/track] failed to persist inbound event", {
+      error: error.toString(),
+      stack: error?.stack ?? null,
+      trace_id: traceId,
+      site_id: site.site_id,
+      video_id,
+      percent: percentValue,
+      event_id: eventId
+    });
+    const wantsDebug = req.get("x-debug") === "1" || req.query?.debug === "1";
+    if (wantsDebug) {
+      return res.status(500).json({
+        ok: false,
+        error: "failed to persist inbound event",
+        trace_id: traceId,
+        details: error.toString(),
+        stack: process.env.NODE_ENV === "production" ? undefined : error?.stack ?? null
+      });
+    }
     return res.status(500).json({ ok: false, error: "failed to persist inbound event" });
   }
 
