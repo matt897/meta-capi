@@ -1830,6 +1830,21 @@ app.get("/api/errors/recent", requireAuth, async (req, res) => {
   res.json({ ok: true, rows });
 });
 
+app.get("/api/events/recent", requireAuth, async (req, res) => {
+  const limit = Number.parseInt(req.query.limit ?? "50", 10);
+  const safeLimit = Number.isNaN(limit) ? 50 : Math.min(Math.max(limit, 1), 200);
+  const rows = await listEvents(db, { limit: safeLimit });
+  const mappedRows = rows.map(row => ({
+    id: row.id,
+    received_at: row.received_at_utc_ms ?? row.received_at ?? row.created_at ?? null,
+    site_name: row.site_name ?? null,
+    event_name: row.event_name ?? null,
+    pixel_id: row.pixel_id ?? null,
+    status: resolveOutboundStatus(row.outbound_result) || row.status || null
+  }));
+  res.json({ ok: true, rows: mappedRows });
+});
+
 app.get("/api/inbound/recent", requireAuth, async (req, res) => {
   const limit = Number.parseInt(req.query.limit ?? "50", 10);
   const safeLimit = Number.isNaN(limit) ? 50 : Math.min(Math.max(limit, 1), 200);
@@ -2130,7 +2145,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
             <th>Status</th>
           </tr>
         </thead>
-        <tbody>
+        <tbody id="recent-activity-body">
           ${recentEvents
             .map(
               event => `
@@ -2156,7 +2171,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
             <th>Site</th>
           </tr>
         </thead>
-        <tbody>
+        <tbody id="recent-errors-body">
           ${recentErrors
             .map(error => {
               const message = error.message ?? "—";
@@ -2209,8 +2224,20 @@ app.get("/dashboard", requireAuth, async (req, res) => {
       const liveInboundBody = document.getElementById('live-inbound-body');
       const liveInboundUpdated = document.getElementById('live-inbound-updated');
       const liveInboundCount = document.getElementById('live-inbound-count');
+      const recentActivityBody = document.getElementById('recent-activity-body');
+      const recentErrorsBody = document.getElementById('recent-errors-body');
       const liveTimeZone = ${JSON.stringify(cachedTimeZone)};
       let lastRenderedId = null;
+
+      function formatDashboardTime(value) {
+        if (!value) return '—';
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) return value;
+        if (liveTimeZone) {
+          return date.toLocaleString('en-US', { timeZone: liveTimeZone });
+        }
+        return date.toLocaleString();
+      }
 
       function formatInboundTime(value) {
         if (!value) return '—';
@@ -2227,6 +2254,69 @@ app.get("/dashboard", requireAuth, async (req, res) => {
         if (className) cell.className = className;
         cell.textContent = text === null || text === undefined || text === '' ? '—' : String(text);
         return cell;
+      }
+
+      function createStatusPill(status) {
+        const normalized = status || 'unknown';
+        const pill = document.createElement('span');
+        pill.className = 'pill pill-' + normalized;
+        pill.textContent = normalized.replace('_', ' ');
+        return pill;
+      }
+
+      function truncateText(value, maxLength) {
+        const text = value || '';
+        if (text.length <= maxLength) return text;
+        return text.slice(0, maxLength - 1) + '…';
+      }
+
+      function renderRecentEventRow(event) {
+        const tr = document.createElement('tr');
+        tr.appendChild(createCell(formatDashboardTime(event.received_at)));
+        tr.appendChild(createCell(event.site_name));
+        const eventCell = document.createElement('td');
+        const link = document.createElement('a');
+        link.href = '/dashboard/events/' + event.id;
+        link.textContent = event.event_name || '—';
+        eventCell.appendChild(link);
+        tr.appendChild(eventCell);
+        tr.appendChild(createCell(event.pixel_id));
+        const statusCell = document.createElement('td');
+        statusCell.appendChild(createStatusPill(event.status));
+        tr.appendChild(statusCell);
+        return tr;
+      }
+
+      function renderRecentErrorRow(error) {
+        const tr = document.createElement('tr');
+        tr.appendChild(createCell(formatDashboardTime(error.created_at)));
+        tr.appendChild(createCell(error.type));
+        const messageCell = document.createElement('td');
+        const message = error.message || '—';
+        messageCell.textContent = truncateText(message, 140);
+        messageCell.title = message;
+        tr.appendChild(messageCell);
+        tr.appendChild(createCell(error.site_name));
+        return tr;
+      }
+
+      async function loadRecentActivity() {
+        const [eventsResponse, errorsResponse] = await Promise.all([
+          fetch('/api/events/recent?limit=10'),
+          fetch('/api/errors/recent?limit=10')
+        ]);
+        const eventsPayload = await eventsResponse.json();
+        if (eventsPayload && eventsPayload.ok && recentActivityBody) {
+          recentActivityBody.replaceChildren(
+            ...(eventsPayload.rows || []).map(renderRecentEventRow)
+          );
+        }
+        const errorsPayload = await errorsResponse.json();
+        if (errorsPayload && errorsPayload.ok && recentErrorsBody) {
+          recentErrorsBody.replaceChildren(
+            ...(errorsPayload.rows || []).map(renderRecentErrorRow)
+          );
+        }
       }
 
       function renderInboundRow(row) {
@@ -2274,7 +2364,9 @@ app.get("/dashboard", requireAuth, async (req, res) => {
       }
 
       loadInbound();
+      loadRecentActivity();
       setInterval(loadInbound, 2000);
+      setInterval(loadRecentActivity, 5000);
     </script>
   `;
 
