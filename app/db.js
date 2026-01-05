@@ -368,32 +368,58 @@ export async function getSiteByKey(db, siteKey) {
 
 export async function insertEvent(db, event) {
   const receivedAtUtcMs = event.received_at_utc_ms ?? Date.now();
+  const columns = [
+    "site_id",
+    "type",
+    "event_id",
+    "event_name",
+    "test_event_code",
+    "video_id",
+    "percent",
+    "event_source_url",
+    "status",
+    "inbound_json",
+    "outbound_json",
+    "meta_status",
+    "meta_body",
+    "video_mode",
+    "user_agent",
+    "ip_address",
+    "received_at",
+    "received_at_utc_ms",
+    "trace_id",
+    "event_time_client",
+    "last_seen_at",
+    "duplicate_count",
+    "outbound_result",
+    "outbound_reason"
+  ];
+  const values = columns.map((column) => (column === "received_at" ? "COALESCE(?, CURRENT_TIMESTAMP)" : "?"));
+  const params = columns.map((column) => {
+    switch (column) {
+      case "received_at":
+        return event.received_at ?? null;
+      case "received_at_utc_ms":
+        return receivedAtUtcMs;
+      case "duplicate_count":
+        return event.duplicate_count ?? 0;
+      case "status":
+        return event.status;
+      default:
+        return event[column] ?? null;
+    }
+  });
+  if (process.env.NODE_ENV !== "production") {
+    const placeholderCount = values.reduce((count, value) => count + (value.match(/\?/g) ?? []).length, 0);
+    if (placeholderCount !== columns.length || params.length !== columns.length) {
+      throw new Error(
+        `insertEvent mismatch: columns=${columns.length} placeholders=${placeholderCount} params=${params.length}`
+      );
+    }
+  }
   const result = await db.run(
-    "INSERT INTO events (site_id, type, event_id, event_name, test_event_code, video_id, percent, event_source_url, status, inbound_json, outbound_json, meta_status, meta_body, video_mode, user_agent, ip_address, received_at, received_at_utc_ms, trace_id, event_time_client, last_seen_at, duplicate_count, outbound_result, outbound_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?, ?, ?, ?, ?, ?)",
-    event.site_id,
-    event.type ?? null,
-    event.event_id ?? null,
-    event.event_name ?? null,
-    event.test_event_code ?? null,
-    event.video_id ?? null,
-    event.percent ?? null,
-    event.event_source_url ?? null,
-    event.status,
-    event.inbound_json ?? null,
-    event.outbound_json ?? null,
-    event.meta_status ?? null,
-    event.meta_body ?? null,
-    event.video_mode ?? null,
-    event.user_agent ?? null,
-    event.ip_address ?? null,
-    event.received_at ?? null,
-    receivedAtUtcMs,
-    event.trace_id ?? null,
-    event.event_time_client ?? null,
-    event.last_seen_at ?? null,
-    event.duplicate_count ?? 0,
-    event.outbound_result ?? null,
-    event.outbound_reason ?? null
+    `INSERT INTO events (${columns.join(", ")}) VALUES (${values.join(", ")})`,
+    ...params
   );
   return result.lastID;
 }
