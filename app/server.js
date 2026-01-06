@@ -1712,8 +1712,25 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
           }
 
           const sessionId = getSessionId();
-          const firedStorageKey = 'metaCapiVideoMilestones:' + videoId;
-          const fired = new Set(getPersistedMilestones(firedStorageKey));
+          const firedStorageKey = 'metaCapiVideoMilestones:' + siteKey + ':' + videoId;
+          const legacyStorageKey = 'metaCapiVideoMilestones:' + videoId;
+          const fired = new Set();
+          const legacyMilestones = getPersistedMilestones(legacyStorageKey);
+          const storedMilestones = getPersistedMilestones(firedStorageKey);
+          [...legacyMilestones, ...storedMilestones].forEach(milestone => fired.add(milestone));
+          if (legacyMilestones.length) {
+            persistMilestones(firedStorageKey, Array.from(fired.values()));
+            try {
+              localStorage.removeItem(legacyStorageKey);
+              log('migrated legacy milestones', {
+                legacyStorageKey,
+                storageKey: firedStorageKey,
+                migrated: legacyMilestones
+              });
+            } catch (migrateErr) {
+              warn('failed to clear legacy milestones', migrateErr);
+            }
+          }
           const tickIntervalMs = 250;
           let watchedSeconds = 0;
           let lastTime = video.currentTime || 0;
@@ -1774,7 +1791,7 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
             if (fired.has(percent)) return;
             fired.add(percent);
             updateFiredStorage();
-            const eventId = await sha256Hex(videoId + '|' + percent + '|' + sessionId);
+            const eventId = await sha256Hex(siteKey + '|' + videoId + '|' + percent + '|' + sessionId);
             if (debug) {
               console.log('[CAPI VT] milestone', {
                 milestone: percent,
