@@ -23,6 +23,15 @@ export async function initDb(dbPath) {
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
+    CREATE TABLE IF NOT EXISTS datasets (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      dataset_id TEXT NOT NULL UNIQUE,
+      access_token TEXT NOT NULL,
+      is_active INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
     CREATE TABLE IF NOT EXISTS events (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       site_id TEXT,
@@ -55,6 +64,8 @@ export async function initDb(dbPath) {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       inbound_id INTEGER NOT NULL,
       attempted_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      dataset_fk INTEGER,
+      dataset_id TEXT,
       mode_used TEXT,
       request_payload_json TEXT,
       http_status INTEGER,
@@ -122,6 +133,9 @@ export async function initDb(dbPath) {
   await addColumn("events", "trace_id TEXT");
   await addColumn("events", "event_time_client INTEGER");
   await addColumn("events", "test_event_code TEXT");
+  await addColumn("sites", "dataset_fk INTEGER");
+  await addColumn("outbound_logs", "dataset_fk INTEGER");
+  await addColumn("outbound_logs", "dataset_id TEXT");
 
   const columns = await db.all("PRAGMA table_info(sites)");
   const columnNames = new Set(columns.map(column => column.name));
@@ -136,6 +150,37 @@ export async function initDb(dbPath) {
   if (!columnNames.has("updated_at")) {
     await db.exec("ALTER TABLE sites ADD COLUMN updated_at TEXT");
     await db.run("UPDATE sites SET updated_at = created_at WHERE updated_at IS NULL");
+  }
+
+  const datasetCountRow = await db.get("SELECT COUNT(*) as count FROM datasets");
+  const datasetCount = datasetCountRow?.count ?? 0;
+  let defaultDatasetId = null;
+
+  if (datasetCount === 0) {
+    const siteRow = await db.get(
+      "SELECT pixel_id, access_token FROM sites ORDER BY created_at ASC LIMIT 1"
+    );
+    const datasetIdValue = siteRow?.pixel_id ?? "default";
+    const accessTokenValue = siteRow?.access_token ?? "";
+    const insertResult = await db.run(
+      "INSERT INTO datasets (name, dataset_id, access_token, is_active) VALUES (?, ?, ?, 1)",
+      "Default dataset",
+      datasetIdValue,
+      accessTokenValue
+    );
+    defaultDatasetId = insertResult.lastID;
+  }
+
+  if (defaultDatasetId === null) {
+    const defaultRow = await db.get("SELECT id FROM datasets ORDER BY created_at ASC LIMIT 1");
+    defaultDatasetId = defaultRow?.id ?? null;
+  }
+
+  if (defaultDatasetId !== null) {
+    await db.run(
+      "UPDATE sites SET dataset_fk = ? WHERE dataset_fk IS NULL",
+      defaultDatasetId
+    );
   }
 
   const eventColumns = await db.all("PRAGMA table_info(events)");
@@ -319,7 +364,7 @@ export async function updateUserPassword(db, userId, passwordHash) {
 
 export async function createSite(db, site) {
   await db.run(
-    "INSERT INTO sites (site_id, site_key, name, pixel_id, access_token, test_event_code, send_to_meta, dry_run, log_full_payloads, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+    "INSERT INTO sites (site_id, site_key, name, pixel_id, access_token, test_event_code, send_to_meta, dry_run, log_full_payloads, dataset_fk, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
     site.site_id,
     site.site_key,
     site.name,
@@ -328,13 +373,14 @@ export async function createSite(db, site) {
     site.test_event_code,
     site.send_to_meta ? 1 : 0,
     site.dry_run ? 1 : 0,
-    site.log_full_payloads ? 1 : 0
+    site.log_full_payloads ? 1 : 0,
+    site.dataset_fk ?? null
   );
 }
 
 export async function updateSite(db, site) {
   await db.run(
-    "UPDATE sites SET name = ?, pixel_id = ?, access_token = ?, test_event_code = ?, send_to_meta = ?, dry_run = ?, log_full_payloads = ?, updated_at = CURRENT_TIMESTAMP WHERE site_id = ?",
+    "UPDATE sites SET name = ?, pixel_id = ?, access_token = ?, test_event_code = ?, send_to_meta = ?, dry_run = ?, log_full_payloads = ?, dataset_fk = ?, updated_at = CURRENT_TIMESTAMP WHERE site_id = ?",
     site.name,
     site.pixel_id,
     site.access_token,
@@ -342,6 +388,7 @@ export async function updateSite(db, site) {
     site.send_to_meta ? 1 : 0,
     site.dry_run ? 1 : 0,
     site.log_full_payloads ? 1 : 0,
+    site.dataset_fk ?? null,
     site.site_id
   );
 }
@@ -355,15 +402,119 @@ export async function deleteSite(db, siteId) {
 }
 
 export async function getSites(db) {
-  return db.all("SELECT * FROM sites ORDER BY created_at DESC");
+  return db.all(
+    `
+      SELECT sites.*,
+        datasets.name AS dataset_name,
+        datasets.dataset_id AS dataset_id,
+        datasets.access_token AS dataset_access_token,
+        datasets.is_active AS dataset_is_active
+      FROM sites
+      LEFT JOIN datasets ON sites.dataset_fk = datasets.id
+      ORDER BY sites.created_at DESC
+    `
+  );
 }
 
 export async function getSiteById(db, siteId) {
-  return db.get("SELECT * FROM sites WHERE site_id = ?", siteId);
+  return db.get(
+    `
+      SELECT sites.*,
+        datasets.name AS dataset_name,
+        datasets.dataset_id AS dataset_id,
+        datasets.access_token AS dataset_access_token,
+        datasets.is_active AS dataset_is_active
+      FROM sites
+      LEFT JOIN datasets ON sites.dataset_fk = datasets.id
+      WHERE sites.site_id = ?
+    `,
+    siteId
+  );
 }
 
 export async function getSiteByKey(db, siteKey) {
-  return db.get("SELECT * FROM sites WHERE site_key = ?", siteKey);
+  return db.get(
+    `
+      SELECT sites.*,
+        datasets.name AS dataset_name,
+        datasets.dataset_id AS dataset_id,
+        datasets.access_token AS dataset_access_token,
+        datasets.is_active AS dataset_is_active
+      FROM sites
+      LEFT JOIN datasets ON sites.dataset_fk = datasets.id
+      WHERE sites.site_key = ?
+    `,
+    siteKey
+  );
+}
+
+export async function listDatasets(db) {
+  return db.all("SELECT * FROM datasets ORDER BY created_at DESC");
+}
+
+export async function getDatasetById(db, datasetId) {
+  return db.get("SELECT * FROM datasets WHERE id = ?", datasetId);
+}
+
+export async function createDataset(db, dataset) {
+  const result = await db.run(
+    "INSERT INTO datasets (name, dataset_id, access_token, is_active) VALUES (?, ?, ?, ?)",
+    dataset.name,
+    dataset.dataset_id,
+    dataset.access_token,
+    dataset.is_active ? 1 : 0
+  );
+  return result.lastID;
+}
+
+export async function updateDataset(db, dataset) {
+  await db.run(
+    "UPDATE datasets SET name = ?, dataset_id = ?, access_token = ?, is_active = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+    dataset.name,
+    dataset.dataset_id,
+    dataset.access_token,
+    dataset.is_active ? 1 : 0,
+    dataset.id
+  );
+}
+
+export async function deleteDataset(db, datasetId) {
+  await db.run("DELETE FROM datasets WHERE id = ?", datasetId);
+}
+
+export async function listSitesByDataset(db, datasetId) {
+  return db.all(
+    `
+      SELECT sites.*,
+        datasets.name AS dataset_name,
+        datasets.dataset_id AS dataset_id,
+        datasets.access_token AS dataset_access_token,
+        datasets.is_active AS dataset_is_active
+      FROM sites
+      LEFT JOIN datasets ON sites.dataset_fk = datasets.id
+      WHERE sites.dataset_fk = ?
+      ORDER BY sites.created_at DESC
+    `,
+    datasetId
+  );
+}
+
+export async function listVideosByDataset(db, datasetId) {
+  return db.all(
+    `
+      SELECT videos.*,
+        sites.name AS site_name,
+        sites.site_key AS site_key,
+        datasets.name AS dataset_name,
+        datasets.dataset_id AS dataset_id
+      FROM videos
+      LEFT JOIN sites ON videos.site_id = sites.site_id
+      LEFT JOIN datasets ON sites.dataset_fk = datasets.id
+      WHERE sites.dataset_fk = ?
+      ORDER BY videos.created_at DESC
+    `,
+    datasetId
+  );
 }
 
 export async function insertEvent(db, event) {
@@ -437,8 +588,10 @@ export async function updateEventMeta(db, eventId, { status, outboundJson, metaS
 
 export async function insertOutboundLog(db, outbound) {
   const result = await db.run(
-    "INSERT INTO outbound_logs (inbound_id, mode_used, request_payload_json, http_status, response_body_json, fbtrace_id, result, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    "INSERT INTO outbound_logs (inbound_id, dataset_fk, dataset_id, mode_used, request_payload_json, http_status, response_body_json, fbtrace_id, result, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     outbound.inbound_id,
+    outbound.dataset_fk ?? null,
+    outbound.dataset_id ?? null,
     outbound.mode_used ?? null,
     outbound.request_payload_json ?? null,
     outbound.http_status ?? null,
@@ -486,7 +639,7 @@ function safeJsonParse(value) {
 
 export async function listEvents(
   db,
-  { limit = 50, siteId, status, eventName, videoId, eventType, receivedAtRange }
+  { limit = 50, siteId, datasetId, status, eventName, videoId, eventType, receivedAtRange }
 ) {
   const conditions = [];
   const params = [];
@@ -494,6 +647,10 @@ export async function listEvents(
   if (siteId) {
     conditions.push("events.site_id = ?");
     params.push(siteId);
+  }
+  if (datasetId) {
+    conditions.push("sites.dataset_fk = ?");
+    params.push(datasetId);
   }
   if (status) {
     const normalizedStatus = String(status);
@@ -530,6 +687,8 @@ export async function listEvents(
       SELECT events.*,
         sites.name AS site_name,
         sites.pixel_id AS pixel_id,
+        datasets.name AS dataset_name,
+        datasets.dataset_id AS dataset_id,
         outbound.mode_used AS outbound_mode_used,
         outbound.request_payload_json AS outbound_request_json,
         outbound.http_status AS outbound_http_status,
@@ -550,6 +709,7 @@ export async function listEvents(
           GROUP BY inbound_id
         ) latest ON latest.inbound_id = outbound_logs.inbound_id AND latest.max_id = outbound_logs.id
       ) outbound ON outbound.inbound_id = events.id
+      LEFT JOIN datasets ON sites.dataset_fk = datasets.id
       ${whereClause}
       ORDER BY events.received_at_utc_ms DESC, events.id DESC
       LIMIT ?
@@ -574,6 +734,8 @@ export async function getEventById(db, eventId) {
       SELECT events.*,
         sites.name AS site_name,
         sites.pixel_id AS pixel_id,
+        datasets.name AS dataset_name,
+        datasets.dataset_id AS dataset_id,
         outbound.mode_used AS outbound_mode_used,
         outbound.request_payload_json AS outbound_request_json,
         outbound.http_status AS outbound_http_status,
@@ -594,6 +756,7 @@ export async function getEventById(db, eventId) {
           GROUP BY inbound_id
         ) latest ON latest.inbound_id = outbound_logs.inbound_id AND latest.max_id = outbound_logs.id
       ) outbound ON outbound.inbound_id = events.id
+      LEFT JOIN datasets ON sites.dataset_fk = datasets.id
       WHERE events.id = ?
     `,
     eventId
@@ -650,9 +813,14 @@ export async function deleteVideo(db, videoId) {
 export async function getVideoById(db, videoId) {
   return db.get(
     `
-      SELECT videos.*, sites.name AS site_name, sites.site_key AS site_key
+      SELECT videos.*,
+        sites.name AS site_name,
+        sites.site_key AS site_key,
+        datasets.name AS dataset_name,
+        datasets.dataset_id AS dataset_id
       FROM videos
       LEFT JOIN sites ON videos.site_id = sites.site_id
+      LEFT JOIN datasets ON sites.dataset_fk = datasets.id
       WHERE videos.id = ?
     `,
     videoId
@@ -670,9 +838,14 @@ export async function getVideoBySiteAndVideoId(db, siteId, videoId) {
 export async function listVideos(db) {
   return db.all(
     `
-      SELECT videos.*, sites.name AS site_name, sites.site_key AS site_key
+      SELECT videos.*,
+        sites.name AS site_name,
+        sites.site_key AS site_key,
+        datasets.name AS dataset_name,
+        datasets.dataset_id AS dataset_id
       FROM videos
       LEFT JOIN sites ON videos.site_id = sites.site_id
+      LEFT JOIN datasets ON sites.dataset_fk = datasets.id
       ORDER BY videos.created_at DESC
     `
   );
@@ -691,23 +864,50 @@ export async function insertError(db, error) {
   );
 }
 
-export async function listErrorGroups(db) {
+export async function listErrorGroups(db, datasetId) {
+  const conditions = [];
+  const params = [];
+  if (datasetId) {
+    conditions.push("sites.dataset_fk = ?");
+    params.push(datasetId);
+  }
+  const whereClause = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
   return db.all(
-    "SELECT type, COUNT(*) as count FROM errors GROUP BY type ORDER BY count DESC"
+    `
+      SELECT errors.type, COUNT(*) as count
+      FROM errors
+      LEFT JOIN sites ON errors.site_id = sites.site_id
+      ${whereClause}
+      GROUP BY errors.type
+      ORDER BY count DESC
+    `,
+    ...params
   );
 }
 
-export async function listErrors(db, { type, limit = 20 }) {
+export async function listErrors(db, { type, limit = 20, datasetId }) {
+  const conditions = ["errors.type = ?"];
+  const params = [type];
+  if (datasetId) {
+    conditions.push("sites.dataset_fk = ?");
+    params.push(datasetId);
+  }
+  const whereClause = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
   const rows = await db.all(
     `
-      SELECT errors.*, sites.name AS site_name, sites.pixel_id AS pixel_id
+      SELECT errors.*,
+        sites.name AS site_name,
+        sites.pixel_id AS pixel_id,
+        datasets.name AS dataset_name,
+        datasets.dataset_id AS dataset_id
       FROM errors
       LEFT JOIN sites ON errors.site_id = sites.site_id
-      WHERE errors.type = ?
+      LEFT JOIN datasets ON sites.dataset_fk = datasets.id
+      ${whereClause}
       ORDER BY errors.id DESC
       LIMIT ?
     `,
-    type,
+    ...params,
     limit
   );
 
@@ -717,15 +917,29 @@ export async function listErrors(db, { type, limit = 20 }) {
   }));
 }
 
-export async function listRecentErrors(db, limit = 20) {
+export async function listRecentErrors(db, limit = 20, datasetId) {
+  const conditions = [];
+  const params = [];
+  if (datasetId) {
+    conditions.push("sites.dataset_fk = ?");
+    params.push(datasetId);
+  }
+  const whereClause = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
   const rows = await db.all(
     `
-      SELECT errors.*, sites.name AS site_name, sites.pixel_id AS pixel_id
+      SELECT errors.*,
+        sites.name AS site_name,
+        sites.pixel_id AS pixel_id,
+        datasets.name AS dataset_name,
+        datasets.dataset_id AS dataset_id
       FROM errors
       LEFT JOIN sites ON errors.site_id = sites.site_id
+      LEFT JOIN datasets ON sites.dataset_fk = datasets.id
+      ${whereClause}
       ORDER BY errors.id DESC
       LIMIT ?
     `,
+    ...params,
     limit
   );
 
@@ -735,43 +949,87 @@ export async function listRecentErrors(db, limit = 20) {
   }));
 }
 
-export async function listRecentEventsForError(db, errorType, limit = 5) {
+export async function listRecentEventsForError(db, errorType, limit = 5, datasetId) {
+  const conditions = ["errors.type = ?"];
+  const params = [errorType];
+  if (datasetId) {
+    conditions.push("sites.dataset_fk = ?");
+    params.push(datasetId);
+  }
+  const whereClause = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
   return db.all(
     `
       SELECT events.id, events.event_name, events.event_id, events.status, events.created_at,
-        sites.name AS site_name, sites.pixel_id AS pixel_id
+        sites.name AS site_name,
+        sites.pixel_id AS pixel_id,
+        datasets.name AS dataset_name,
+        datasets.dataset_id AS dataset_id
       FROM errors
       JOIN events ON errors.event_db_id = events.id
       LEFT JOIN sites ON events.site_id = sites.site_id
-      WHERE errors.type = ?
+      LEFT JOIN datasets ON sites.dataset_fk = datasets.id
+      ${whereClause}
       ORDER BY errors.id DESC
       LIMIT ?
     `,
-    errorType,
+    ...params,
     limit
   );
 }
 
-export async function countEventsSince(db, hours) {
+export async function countEventsSince(db, hours, datasetId) {
+  const params = [`-${hours} hours`];
+  let whereClause = "WHERE events.created_at > datetime('now', ?)";
+  if (datasetId) {
+    whereClause += " AND sites.dataset_fk = ?";
+    params.push(datasetId);
+  }
   const row = await db.get(
-    "SELECT COUNT(*) as count FROM events WHERE created_at > datetime('now', ?)",
-    `-${hours} hours`
+    `
+      SELECT COUNT(*) as count
+      FROM events
+      LEFT JOIN sites ON events.site_id = sites.site_id
+      ${whereClause}
+    `,
+    ...params
   );
   return row?.count ?? 0;
 }
 
-export async function countErrorsSince(db, hours) {
+export async function countErrorsSince(db, hours, datasetId) {
+  const params = [`-${hours} hours`];
+  let whereClause = "WHERE errors.created_at > datetime('now', ?)";
+  if (datasetId) {
+    whereClause += " AND sites.dataset_fk = ?";
+    params.push(datasetId);
+  }
   const row = await db.get(
-    "SELECT COUNT(*) as count FROM errors WHERE created_at > datetime('now', ?)",
-    `-${hours} hours`
+    `
+      SELECT COUNT(*) as count
+      FROM errors
+      LEFT JOIN sites ON errors.site_id = sites.site_id
+      ${whereClause}
+    `,
+    ...params
   );
   return row?.count ?? 0;
 }
 
-export async function countDedupedSince(db, hours) {
+export async function countDedupedSince(db, hours, datasetId) {
+  const params = [`-${hours} hours`];
+  let whereClause = "WHERE events.status = 'deduped' AND events.created_at > datetime('now', ?)";
+  if (datasetId) {
+    whereClause += " AND sites.dataset_fk = ?";
+    params.push(datasetId);
+  }
   const row = await db.get(
-    "SELECT COUNT(*) as count FROM events WHERE status = 'deduped' AND created_at > datetime('now', ?)",
-    `-${hours} hours`
+    `
+      SELECT COUNT(*) as count
+      FROM events
+      LEFT JOIN sites ON events.site_id = sites.site_id
+      ${whereClause}
+    `,
+    ...params
   );
   return row?.count ?? 0;
 }

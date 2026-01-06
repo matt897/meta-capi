@@ -16,12 +16,15 @@ import {
   countErrorsTodayBySite,
   countEventsSince,
   countEventsTodayBySite,
+  createDataset,
   createSite,
   createVideo,
   createUser,
+  deleteDataset,
   deleteSite,
   deleteVideo,
   ensureSetting,
+  getDatasetById,
   getUserById,
   getUserByUsername,
   getEventById,
@@ -37,6 +40,9 @@ import {
   listErrorGroups,
   listErrors,
   listEvents,
+  listDatasets,
+  listSitesByDataset,
+  listVideosByDataset,
   listVideos,
   listRecentErrors,
   listSettings,
@@ -45,6 +51,7 @@ import {
   setSetting,
   updateUserPassword,
   storeEventId,
+  updateDataset,
   updateSite,
   updateVideo,
   getSetting,
@@ -232,6 +239,31 @@ app.use(
   })
 );
 
+function resolveSelectedDatasetId(req) {
+  const queryValue = req.query?.dataset ?? req.query?.pixel;
+  if (queryValue !== undefined) {
+    const trimmed = String(queryValue).trim();
+    if (!trimmed) {
+      req.session.selectedDatasetId = null;
+      return null;
+    }
+    const parsed = Number.parseInt(trimmed, 10);
+    if (!Number.isNaN(parsed)) {
+      req.session.selectedDatasetId = parsed;
+      return parsed;
+    }
+    req.session.selectedDatasetId = null;
+    return null;
+  }
+  return req.session?.selectedDatasetId ?? null;
+}
+
+app.use((req, res, next) => {
+  resolveSelectedDatasetId(req);
+  res.locals.selectedDatasetId = req.session?.selectedDatasetId ?? null;
+  next();
+});
+
 app.use("/assets", express.static(path.join(process.cwd(), "public")));
 
 const rateLimitState = new Map();
@@ -297,7 +329,7 @@ async function logMetaSend({ site, mode, testEventCode, status, responseBody }) 
     type: "meta_send",
     site_id: site?.site_id ?? null,
     mode,
-    pixel_id: maskPixelId(site?.pixel_id),
+    dataset_id: maskPixelId(site?.dataset_id ?? site?.pixel_id),
     test_event_code: Boolean(testEventCode),
     fbtrace_id: responseBody?.fbtrace_id ?? null,
     events_received: responseBody?.events_received ?? null,
@@ -368,8 +400,8 @@ function decryptToken(value) {
 }
 
 function resolveAccessToken(site) {
-  if (!site?.access_token) return null;
-  return decryptToken(site.access_token);
+  if (!site?.dataset_access_token && !site?.access_token) return null;
+  return decryptToken(site.dataset_access_token ?? site.access_token);
 }
 
 function renderPage({ title, body, nav = true }) {
@@ -377,6 +409,7 @@ function renderPage({ title, body, nav = true }) {
     ? `
     <nav class="nav">
       <a href="/dashboard">Dashboard</a>
+      <a href="/admin/datasets">Datasets</a>
       <a href="/dashboard/sites">Sites</a>
       <a href="/dashboard/videos">Videos</a>
       <a href="/dashboard/live">Logs</a>
@@ -461,6 +494,39 @@ function maskToken(token) {
   const trimmed = token.trim();
   if (trimmed.length <= 8) return "••••";
   return `${trimmed.slice(0, 4)}…${trimmed.slice(-4)}`;
+}
+
+function maskTokenTail(token, tailLength = 6) {
+  if (!token) return "—";
+  const trimmed = token.trim();
+  if (trimmed.length <= tailLength) return "••••";
+  return `••••••${trimmed.slice(-tailLength)}`;
+}
+
+function formatDatasetLabel(dataset) {
+  if (!dataset) return "Dataset —";
+  const name = dataset.name ?? dataset.dataset_name ?? "Dataset";
+  const id = dataset.dataset_id ?? "—";
+  return `${name} (${id})`;
+}
+
+function formatDatasetLabelFromSite(site) {
+  return formatDatasetLabel({ name: site?.dataset_name, dataset_id: site?.dataset_id });
+}
+
+function buildDatasetOptions(datasets, selectedId, { includeAll = true } = {}) {
+  const options = [];
+  if (includeAll) {
+    options.push(`<option value="" ${selectedId ? "" : "selected"}>All datasets</option>`);
+  }
+  datasets.forEach(dataset => {
+    const isSelected = String(dataset.id) === String(selectedId);
+    const label = formatDatasetLabel(dataset);
+    options.push(
+      `<option value="${dataset.id}" ${isSelected ? "selected" : ""}>${escapeHtml(label)}</option>`
+    );
+  });
+  return options.join("");
 }
 
 function slugify(value) {
@@ -625,8 +691,11 @@ function normalizeVideoMode(value) {
 
 function getSiteStatus(site) {
   const accessToken = resolveAccessToken(site);
-  if (!site.pixel_id || !accessToken) {
+  if (!site.dataset_id || !accessToken) {
     return "not_configured";
+  }
+  if (site.dataset_is_active === 0) {
+    return "dataset_inactive";
   }
   if (!site.send_to_meta || site.dry_run) {
     return "dry_run";
@@ -988,6 +1057,8 @@ async function sendToMeta({ url, payload, retryCount }) {
 
 async function sendTestEvent({ site, eventType, overrides }) {
   const accessToken = resolveAccessToken(site);
+  const datasetId = site.dataset_id ?? null;
+  const datasetInactive = site.dataset_is_active === 0;
   const hashedOverrides = buildHashedUserData(overrides);
   const preparedOverrides = {
     ...overrides,
@@ -1026,7 +1097,7 @@ async function sendTestEvent({ site, eventType, overrides }) {
     note: ""
   };
 
-  if (!site.pixel_id || !accessToken) {
+  if (!datasetId || !accessToken) {
     await insertEvent(db, {
       site_id: site.site_id,
       event_id: event.event_id,
@@ -1052,6 +1123,35 @@ async function sendTestEvent({ site, eventType, overrides }) {
       reason: "missing_credentials",
       meta_response: { reason: "missing_credentials" },
       note: "Missing credentials"
+    };
+  }
+
+  if (datasetInactive) {
+    await insertEvent(db, {
+      site_id: site.site_id,
+      event_id: event.event_id,
+      event_name: event.event_name,
+      event_source_url: event.event_source_url,
+      status: "test_event_skipped",
+      inbound_json: inboundLog,
+      outbound_json: outboundLog,
+      meta_status: 0,
+      meta_body: JSON.stringify({ reason: "dataset_inactive" })
+    });
+    await cleanupRetention(db, await getSettingNumber("log_retention_hours", 168));
+    await log({
+      type: "test_event",
+      site_id: site.site_id,
+      message: "dataset inactive",
+      event_type: eventType
+    });
+    return {
+      ...baseResponse,
+      ok: false,
+      forwarded: false,
+      reason: "dataset_inactive",
+      meta_response: { reason: "dataset_inactive" },
+      note: "Dataset disabled"
     };
   }
 
@@ -1116,7 +1216,7 @@ async function sendTestEvent({ site, eventType, overrides }) {
   }
 
   const apiVersion = await getSettingValue("default_meta_api_version", "v24.0");
-  const url = `https://graph.facebook.com/${apiVersion}/${site.pixel_id}/events?access_token=${accessToken}`;
+  const url = `https://graph.facebook.com/${apiVersion}/${datasetId}/events?access_token=${accessToken}`;
 
   try {
     const retryCount = await getSettingNumber("retry_count", 1);
@@ -1732,7 +1832,8 @@ app.get("/admin/sites", requireAuth, async (req, res) => {
     sites.map(site => ({
       site_id: site.site_id,
       name: site.name,
-      pixel_id: site.pixel_id,
+      dataset_id: site.dataset_id,
+      dataset_name: site.dataset_name,
       site_key: site.site_key,
       test_event_code: site.test_event_code,
       send_to_meta: Boolean(site.send_to_meta),
@@ -1742,6 +1843,586 @@ app.get("/admin/sites", requireAuth, async (req, res) => {
       updated_at: site.updated_at
     }))
   );
+});
+
+app.get("/admin/datasets", requireAuth, async (req, res) => {
+  const datasets = await listDatasets(db);
+  const stats = await Promise.all(
+    datasets.map(async dataset => {
+      const sitesCountRow = await db.get(
+        "SELECT COUNT(*) as count FROM sites WHERE dataset_fk = ?",
+        dataset.id
+      );
+      const lastReceivedRow = await db.get(
+        `
+          SELECT MAX(events.received_at_utc_ms) as max
+          FROM events
+          JOIN sites ON events.site_id = sites.site_id
+          WHERE sites.dataset_fk = ?
+        `,
+        dataset.id
+      );
+      const lastSentRow = await db.get(
+        `
+          SELECT MAX(outbound_logs.attempted_at) as max
+          FROM outbound_logs
+          JOIN events ON outbound_logs.inbound_id = events.id
+          JOIN sites ON events.site_id = sites.site_id
+          WHERE sites.dataset_fk = ?
+        `,
+        dataset.id
+      );
+      const errors24hRow = await db.get(
+        `
+          SELECT COUNT(*) as count
+          FROM errors
+          JOIN sites ON errors.site_id = sites.site_id
+          WHERE sites.dataset_fk = ?
+            AND errors.created_at > datetime('now', '-24 hours')
+        `,
+        dataset.id
+      );
+      return {
+        ...dataset,
+        sites_count: sitesCountRow?.count ?? 0,
+        last_received: lastReceivedRow?.max ?? null,
+        last_sent: lastSentRow?.max ?? null,
+        errors_24h: errors24hRow?.count ?? 0
+      };
+    })
+  );
+
+  const notice = req.query.notice ? `<div class="banner info">${escapeHtml(req.query.notice)}</div>` : "";
+  const error = req.query.error ? `<div class="banner warning">${escapeHtml(req.query.error)}</div>` : "";
+  const rows = stats.map(dataset => {
+    const maskedToken = maskTokenTail(decryptToken(dataset.access_token));
+    const statusLabel = dataset.is_active ? "active" : "inactive";
+    return `
+      <tr>
+        <td>
+          <strong>${escapeHtml(dataset.name)}</strong><br />
+          <span class="muted">${escapeHtml(dataset.dataset_id)}</span>
+        </td>
+        <td>${escapeHtml(statusLabel)}</td>
+        <td>${dataset.sites_count}</td>
+        <td>${formatDate(dataset.last_received)}</td>
+        <td>${formatDate(dataset.last_sent)}</td>
+        <td>${dataset.errors_24h}</td>
+        <td>${maskedToken}</td>
+        <td>
+          <div class="actions">
+            <a class="button secondary" href="/admin/datasets/${dataset.id}">View</a>
+            <form method="post" action="/admin/datasets/${dataset.id}/toggle">
+              <button type="submit" class="${dataset.is_active ? "danger" : ""}">${dataset.is_active ? "Disable" : "Enable"}</button>
+            </form>
+            <a class="button secondary" href="/admin/datasets/${dataset.id}#delete">Remove</a>
+          </div>
+        </td>
+      </tr>
+    `;
+  });
+
+  const body = `
+    <div class="card">
+      <h1>Datasets</h1>
+      <p class="muted">Manage Meta dataset/pixel credentials and activity.</p>
+    </div>
+    ${notice}
+    ${error}
+    <div class="card">
+      <h2>Add dataset</h2>
+      <form method="post" action="/admin/datasets" class="form-grid">
+        <label>Name
+          <input name="name" required />
+        </label>
+        <label>Dataset ID
+          <input name="dataset_id" required />
+        </label>
+        <label>Access Token
+          <input name="access_token" required />
+        </label>
+        <label class="checkbox">
+          <input type="checkbox" name="is_active" checked />
+          Active (send outbound events)
+        </label>
+        <button type="submit">Add dataset</button>
+      </form>
+    </div>
+    <div class="card">
+      <h2>All datasets</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Dataset</th>
+            <th>Status</th>
+            <th>Sites</th>
+            <th>Last Received</th>
+            <th>Last Sent</th>
+            <th>Errors (24h)</th>
+            <th>Access Token</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows.join("") || "<tr><td colspan=\"8\" class=\"muted\">No datasets yet.</td></tr>"}
+        </tbody>
+      </table>
+    </div>
+  `;
+
+  res.send(renderPage({ title: "Datasets", body }));
+});
+
+app.get("/dashboard/datasets", requireAuth, (req, res) => {
+  res.redirect("/admin/datasets");
+});
+
+app.post("/admin/datasets", requireAuth, async (req, res) => {
+  const name = req.body.name?.trim();
+  const datasetId = req.body.dataset_id?.trim();
+  const accessToken = req.body.access_token?.trim();
+  const isActive = req.body.is_active !== undefined;
+
+  if (!name || !datasetId || !accessToken) {
+    return res.redirect("/admin/datasets?error=Missing%20required%20fields");
+  }
+
+  try {
+    await createDataset(db, {
+      name,
+      dataset_id: datasetId,
+      access_token: encryptToken(accessToken),
+      is_active: isActive
+    });
+    await log({ type: "admin", message: "dataset created", dataset_id: datasetId });
+    res.redirect("/admin/datasets?notice=Dataset%20created");
+  } catch (error) {
+    res.redirect(`/admin/datasets?error=${encodeURIComponent("Dataset creation failed")}`);
+  }
+});
+
+app.get("/admin/datasets/:datasetId", requireAuth, async (req, res) => {
+  const datasetId = Number.parseInt(req.params.datasetId, 10);
+  const dataset = Number.isNaN(datasetId) ? null : await getDatasetById(db, datasetId);
+  if (!dataset) {
+    return res.status(404).send(renderPage({
+      title: "Dataset not found",
+      body: `<div class="card"><h1>Dataset not found</h1></div>`
+    }));
+  }
+
+  const sites = await listSitesByDataset(db, dataset.id);
+  const videos = await listVideosByDataset(db, dataset.id);
+  const inboundEvents = await listEvents(db, { limit: 25, datasetId: dataset.id });
+  const outboundEvents = (await listEvents(db, { limit: 50, datasetId: dataset.id }))
+    .filter(event => event.outbound_result)
+    .slice(0, 25);
+  const errors = await listRecentErrors(db, 25, dataset.id);
+  const summaryInbound24h = await db.get(
+    `
+      SELECT COUNT(*) as count
+      FROM events
+      JOIN sites ON events.site_id = sites.site_id
+      WHERE sites.dataset_fk = ?
+        AND events.created_at > datetime('now', '-24 hours')
+    `,
+    dataset.id
+  );
+  const summaryOutbound24h = await db.get(
+    `
+      SELECT COUNT(*) as count
+      FROM outbound_logs
+      JOIN events ON outbound_logs.inbound_id = events.id
+      JOIN sites ON events.site_id = sites.site_id
+      WHERE sites.dataset_fk = ?
+        AND outbound_logs.attempted_at > datetime('now', '-24 hours')
+    `,
+    dataset.id
+  );
+  const summaryErrors24h = await db.get(
+    `
+      SELECT COUNT(*) as count
+      FROM errors
+      JOIN sites ON errors.site_id = sites.site_id
+      WHERE sites.dataset_fk = ?
+        AND errors.created_at > datetime('now', '-24 hours')
+    `,
+    dataset.id
+  );
+  const summaryLastReceived = await db.get(
+    `
+      SELECT MAX(events.received_at_utc_ms) as max
+      FROM events
+      JOIN sites ON events.site_id = sites.site_id
+      WHERE sites.dataset_fk = ?
+    `,
+    dataset.id
+  );
+  const summaryLastSent = await db.get(
+    `
+      SELECT MAX(outbound_logs.attempted_at) as max
+      FROM outbound_logs
+      JOIN events ON outbound_logs.inbound_id = events.id
+      JOIN sites ON events.site_id = sites.site_id
+      WHERE sites.dataset_fk = ?
+    `,
+    dataset.id
+  );
+
+  const otherDatasets = (await listDatasets(db)).filter(item => item.id !== dataset.id);
+  const reassignOptions = otherDatasets
+    .map(item => `<option value="${item.id}">${escapeHtml(formatDatasetLabel(item))}</option>`)
+    .join("");
+
+  const notice = req.query.notice ? `<div class="banner info">${escapeHtml(req.query.notice)}</div>` : "";
+  const error = req.query.error ? `<div class="banner warning">${escapeHtml(req.query.error)}</div>` : "";
+  const maskedToken = maskTokenTail(decryptToken(dataset.access_token));
+
+  const body = `
+    <div class="card">
+      <h1>${escapeHtml(dataset.name)}</h1>
+      <p class="muted">Dataset ID: <code>${escapeHtml(dataset.dataset_id)}</code></p>
+      <p class="muted">Status: <strong>${dataset.is_active ? "Active" : "Inactive"}</strong></p>
+    </div>
+    ${notice}
+    ${error}
+    <div class="grid">
+      <div class="card">
+        <h3>Total sites</h3>
+        <p class="metric">${sites.length}</p>
+      </div>
+      <div class="card">
+        <h3>Total videos</h3>
+        <p class="metric">${videos.length}</p>
+      </div>
+      <div class="card">
+        <h3>Inbound (24h)</h3>
+        <p class="metric">${summaryInbound24h?.count ?? 0}</p>
+      </div>
+      <div class="card">
+        <h3>Outbound (24h)</h3>
+        <p class="metric">${summaryOutbound24h?.count ?? 0}</p>
+      </div>
+      <div class="card">
+        <h3>Errors (24h)</h3>
+        <p class="metric">${summaryErrors24h?.count ?? 0}</p>
+      </div>
+      <div class="card">
+        <h3>Last Received</h3>
+        <p class="metric">${formatDate(summaryLastReceived?.max ?? null)}</p>
+      </div>
+      <div class="card">
+        <h3>Last Sent</h3>
+        <p class="metric">${formatDate(summaryLastSent?.max ?? null)}</p>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Edit dataset</h2>
+      <form method="post" action="/admin/datasets/${dataset.id}" class="form-grid">
+        <label>Name
+          <input name="name" value="${escapeHtml(dataset.name)}" required />
+        </label>
+        <label>Dataset ID
+          <input name="dataset_id" value="${escapeHtml(dataset.dataset_id)}" required />
+        </label>
+        <label>Access Token
+          <input name="access_token" placeholder="Enter new access token (leave blank to keep)" />
+          <span class="muted">Stored token: ${maskedToken}</span>
+        </label>
+        <label class="checkbox">
+          <input type="checkbox" name="is_active" ${dataset.is_active ? "checked" : ""} />
+          Active (send outbound events)
+        </label>
+        <button type="submit">Save dataset</button>
+      </form>
+    </div>
+    <div class="card">
+      <h2>Sites</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Site</th>
+            <th>Site Key</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${sites.map(site => `
+            <tr>
+              <td><a href="/dashboard/sites/${site.site_id}">${escapeHtml(site.name ?? site.site_id)}</a></td>
+              <td><code>${escapeHtml(site.site_key)}</code></td>
+              <td>${renderSiteStatus(site)}</td>
+            </tr>
+          `).join("") || "<tr><td colspan=\"3\" class=\"muted\">No sites assigned.</td></tr>"}
+        </tbody>
+      </table>
+    </div>
+    <div class="card">
+      <h2>Videos</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Video ID</th>
+            <th>Site</th>
+            <th>Mode</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${videos.map(video => `
+            <tr>
+              <td>${escapeHtml(video.video_id)}</td>
+              <td>${escapeHtml(video.site_name ?? "—")}</td>
+              <td>${renderStatusPill(normalizeVideoMode(video.mode))}</td>
+              <td>${video.enabled ? renderStatusPill("enabled") : renderStatusPill("disabled")}</td>
+            </tr>
+          `).join("") || "<tr><td colspan=\"4\" class=\"muted\">No videos assigned.</td></tr>"}
+        </tbody>
+      </table>
+    </div>
+    <div class="card">
+      <h2>Inbound events</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Site</th>
+            <th>Event</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${inboundEvents.map(event => `
+            <tr>
+              <td>${formatDate(event.received_at_utc_ms ?? event.received_at ?? event.created_at)}</td>
+              <td>${escapeHtml(event.site_name ?? "—")}</td>
+              <td><a href="/dashboard/events/${event.id}">${escapeHtml(event.event_name ?? "—")}</a></td>
+              <td>${renderStatusPill(resolveOutboundStatus(event.outbound_result) || event.status)}</td>
+            </tr>
+          `).join("") || "<tr><td colspan=\"4\" class=\"muted\">No inbound events yet.</td></tr>"}
+        </tbody>
+      </table>
+    </div>
+    <div class="card">
+      <h2>Outbound events</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Site</th>
+            <th>Event</th>
+            <th>Result</th>
+            <th>fbtrace_id</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${outboundEvents.map(event => `
+            <tr>
+              <td>${formatDate(event.received_at_utc_ms ?? event.received_at ?? event.created_at)}</td>
+              <td>${escapeHtml(event.site_name ?? "—")}</td>
+              <td><a href="/dashboard/events/${event.id}">${escapeHtml(event.event_name ?? "—")}</a></td>
+              <td>${renderStatusPill(resolveOutboundStatus(event.outbound_result) || event.status)}</td>
+              <td>${escapeHtml(event.outbound_fbtrace_id ?? "—")}</td>
+            </tr>
+          `).join("") || "<tr><td colspan=\"5\" class=\"muted\">No outbound events yet.</td></tr>"}
+        </tbody>
+      </table>
+    </div>
+    <div class="card">
+      <h2>Errors</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Type</th>
+            <th>Message</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${errors.map(errorRow => `
+            <tr>
+              <td>${formatDate(errorRow.created_at)}</td>
+              <td>${escapeHtml(errorRow.type ?? "—")}</td>
+              <td>${escapeHtml(errorRow.message ?? "—")}</td>
+            </tr>
+          `).join("") || "<tr><td colspan=\"3\" class=\"muted\">No errors yet.</td></tr>"}
+        </tbody>
+      </table>
+    </div>
+    <div class="card" id="delete">
+      <h2>Remove dataset</h2>
+      <form method="post" action="/admin/datasets/${dataset.id}/delete" class="form-grid">
+        <label class="checkbox">
+          <input type="radio" name="delete_mode" value="disable" checked />
+          Disable only (keep logs)
+        </label>
+        <label class="checkbox">
+          <input type="radio" name="delete_mode" value="delete" />
+          Delete dataset
+        </label>
+        <label>Reassign sites to another dataset (required to delete if sites exist)
+          <select name="reassign_dataset">
+            <option value="">Do not reassign</option>
+            ${reassignOptions}
+          </select>
+        </label>
+        <label class="checkbox">
+          <input type="checkbox" name="delete_logs" />
+          Delete associated logs + videos (dangerous)
+        </label>
+        <label>Type DELETE to confirm
+          <input name="confirm_text" placeholder="DELETE" />
+        </label>
+        <button type="submit" class="danger">Confirm</button>
+      </form>
+    </div>
+  `;
+
+  res.send(renderPage({ title: `Dataset: ${dataset.name}`, body }));
+});
+
+app.post("/admin/datasets/:datasetId", requireAuth, async (req, res) => {
+  const datasetId = Number.parseInt(req.params.datasetId, 10);
+  const dataset = Number.isNaN(datasetId) ? null : await getDatasetById(db, datasetId);
+  if (!dataset) {
+    return res.status(404).send(renderPage({
+      title: "Dataset not found",
+      body: `<div class="card"><h1>Dataset not found</h1></div>`
+    }));
+  }
+
+  const name = req.body.name?.trim() || dataset.name;
+  const datasetIdentifier = req.body.dataset_id?.trim() || dataset.dataset_id;
+  const accessTokenInput = req.body.access_token?.trim();
+  const accessToken = accessTokenInput ? encryptToken(accessTokenInput) : dataset.access_token;
+  const isActive = req.body.is_active !== undefined;
+
+  try {
+    await updateDataset(db, {
+      id: dataset.id,
+      name,
+      dataset_id: datasetIdentifier,
+      access_token: accessToken,
+      is_active: isActive
+    });
+    await log({ type: "admin", message: "dataset updated", dataset_id: datasetIdentifier });
+    res.redirect(`/admin/datasets/${dataset.id}?notice=Dataset%20updated`);
+  } catch (error) {
+    res.redirect(`/admin/datasets/${dataset.id}?error=${encodeURIComponent("Dataset update failed")}`);
+  }
+});
+
+app.post("/admin/datasets/:datasetId/toggle", requireAuth, async (req, res) => {
+  const datasetId = Number.parseInt(req.params.datasetId, 10);
+  const dataset = Number.isNaN(datasetId) ? null : await getDatasetById(db, datasetId);
+  if (!dataset) {
+    return res.status(404).send(renderPage({
+      title: "Dataset not found",
+      body: `<div class="card"><h1>Dataset not found</h1></div>`
+    }));
+  }
+  await updateDataset(db, {
+    id: dataset.id,
+    name: dataset.name,
+    dataset_id: dataset.dataset_id,
+    access_token: dataset.access_token,
+    is_active: !dataset.is_active
+  });
+  await log({ type: "admin", message: "dataset toggled", dataset_id: dataset.dataset_id });
+  res.redirect(req.get("referer") || "/admin/datasets");
+});
+
+app.post("/admin/datasets/:datasetId/delete", requireAuth, async (req, res) => {
+  const datasetId = Number.parseInt(req.params.datasetId, 10);
+  const dataset = Number.isNaN(datasetId) ? null : await getDatasetById(db, datasetId);
+  if (!dataset) {
+    return res.status(404).send(renderPage({
+      title: "Dataset not found",
+      body: `<div class="card"><h1>Dataset not found</h1></div>`
+    }));
+  }
+
+  const deleteMode = req.body.delete_mode || "disable";
+  const confirmText = req.body.confirm_text || "";
+  const reassignDataset = req.body.reassign_dataset
+    ? Number.parseInt(req.body.reassign_dataset, 10)
+    : null;
+  const deleteLogs = req.body.delete_logs !== undefined;
+
+  if (deleteMode === "disable") {
+    await updateDataset(db, {
+      id: dataset.id,
+      name: dataset.name,
+      dataset_id: dataset.dataset_id,
+      access_token: dataset.access_token,
+      is_active: false
+    });
+    await log({ type: "admin", message: "dataset disabled", dataset_id: dataset.dataset_id });
+    return res.redirect(`/admin/datasets/${dataset.id}?notice=Dataset%20disabled`);
+  }
+
+  if (confirmText !== "DELETE") {
+    return res.redirect(`/admin/datasets/${dataset.id}?error=${encodeURIComponent("Type DELETE to confirm")}`);
+  }
+
+  const sitesCountRow = await db.get(
+    "SELECT COUNT(*) as count FROM sites WHERE dataset_fk = ?",
+    dataset.id
+  );
+  const hasSites = (sitesCountRow?.count ?? 0) > 0;
+
+  if (hasSites && !reassignDataset) {
+    return res.redirect(`/admin/datasets/${dataset.id}?error=${encodeURIComponent("Reassign sites before deleting")}`);
+  }
+
+  if (reassignDataset) {
+    if (reassignDataset === dataset.id) {
+      return res.redirect(`/admin/datasets/${dataset.id}?error=${encodeURIComponent("Choose a different dataset for reassignment")}`);
+    }
+    const targetDataset = await getDatasetById(db, reassignDataset);
+    if (!targetDataset) {
+      return res.redirect(`/admin/datasets/${dataset.id}?error=${encodeURIComponent("Invalid reassignment dataset")}`);
+    }
+  }
+
+  if (deleteLogs) {
+    await db.run(
+      `
+        DELETE FROM outbound_logs
+        WHERE inbound_id IN (
+          SELECT events.id
+          FROM events
+          JOIN sites ON events.site_id = sites.site_id
+          WHERE sites.dataset_fk = ?
+        )
+      `,
+      dataset.id
+    );
+    await db.run(
+      "DELETE FROM events WHERE site_id IN (SELECT site_id FROM sites WHERE dataset_fk = ?)",
+      dataset.id
+    );
+    await db.run(
+      "DELETE FROM errors WHERE site_id IN (SELECT site_id FROM sites WHERE dataset_fk = ?)",
+      dataset.id
+    );
+    await db.run(
+      "DELETE FROM videos WHERE site_id IN (SELECT site_id FROM sites WHERE dataset_fk = ?)",
+      dataset.id
+    );
+  }
+
+  if (reassignDataset) {
+    await db.run(
+      "UPDATE sites SET dataset_fk = ? WHERE dataset_fk = ?",
+      reassignDataset,
+      dataset.id
+    );
+  }
+
+  await deleteDataset(db, dataset.id);
+  await log({ type: "admin", message: "dataset deleted", dataset_id: dataset.dataset_id });
+  res.redirect("/admin/datasets?notice=Dataset%20deleted");
 });
 
 app.post("/admin/sites/:siteId/test-event", requireAuth, async (req, res) => {
@@ -1769,13 +2450,18 @@ app.post("/admin/sites/:siteId/test-event", requireAuth, async (req, res) => {
 app.post("/admin/sites", requireAuth, async (req, res) => {
   const {
     name,
-    pixel_id,
-    access_token,
+    dataset_fk,
     test_event_code,
     send_to_meta,
     dry_run,
     log_full_payloads
   } = req.body;
+
+  const datasetId = Number.parseInt(dataset_fk ?? "", 10);
+  const dataset = Number.isNaN(datasetId) ? null : await getDatasetById(db, datasetId);
+  if (!dataset) {
+    return res.status(400).json({ ok: false, error: "invalid_dataset" });
+  }
 
   const site_id = uuid();
   const site_key = uuid();
@@ -1784,12 +2470,13 @@ app.post("/admin/sites", requireAuth, async (req, res) => {
     site_id,
     site_key,
     name: name || "Untitled site",
-    pixel_id: pixel_id || null,
-    access_token: encryptToken(access_token || null),
+    pixel_id: null,
+    access_token: null,
     test_event_code: test_event_code || null,
     send_to_meta: Boolean(send_to_meta),
     dry_run: dry_run === undefined ? true : Boolean(dry_run),
-    log_full_payloads: log_full_payloads !== false
+    log_full_payloads: log_full_payloads !== false,
+    dataset_fk: dataset.id
   });
 
   await log({ type: "admin", message: "site created", site_id });
@@ -1798,7 +2485,7 @@ app.post("/admin/sites", requireAuth, async (req, res) => {
     site_id,
     site_key,
     name,
-    pixel_id
+    dataset_fk: dataset.id
   });
 });
 
@@ -1824,22 +2511,25 @@ app.get("/api/errors/recent", requireAuth, async (req, res) => {
   const limit = Number.parseInt(req.query.limit ?? "50", 10);
   const safeLimit = Number.isNaN(limit) ? 50 : Math.min(Math.max(limit, 1), 200);
   const type = req.query.type ? String(req.query.type) : "";
+  const datasetId = req.query.dataset_id ?? null;
   const rows = type
-    ? await listErrors(db, { type, limit: safeLimit })
-    : await listRecentErrors(db, safeLimit);
+    ? await listErrors(db, { type, limit: safeLimit, datasetId })
+    : await listRecentErrors(db, safeLimit, datasetId);
   res.json({ ok: true, rows });
 });
 
 app.get("/api/events/recent", requireAuth, async (req, res) => {
   const limit = Number.parseInt(req.query.limit ?? "50", 10);
   const safeLimit = Number.isNaN(limit) ? 50 : Math.min(Math.max(limit, 1), 200);
-  const rows = await listEvents(db, { limit: safeLimit });
+  const datasetId = req.query.dataset_id ?? null;
+  const rows = await listEvents(db, { limit: safeLimit, datasetId });
   const mappedRows = rows.map(row => ({
     id: row.id,
     received_at: row.received_at_utc_ms ?? row.received_at ?? row.created_at ?? null,
     site_name: row.site_name ?? null,
     event_name: row.event_name ?? null,
-    pixel_id: row.pixel_id ?? null,
+    dataset_name: row.dataset_name ?? null,
+    dataset_id: row.dataset_id ?? null,
     status: resolveOutboundStatus(row.outbound_result) || row.status || null
   }));
   res.json({ ok: true, rows: mappedRows });
@@ -1850,6 +2540,7 @@ app.get("/api/inbound/recent", requireAuth, async (req, res) => {
   const safeLimit = Number.isNaN(limit) ? 50 : Math.min(Math.max(limit, 1), 200);
   const siteKey = req.query.site_key ?? null;
   const videoId = req.query.video_id ?? null;
+  const datasetId = req.query.dataset_id ?? null;
   const sinceId = Number.parseInt(req.query.since_id ?? "", 10);
   const conditions = [];
   const params = [];
@@ -1861,6 +2552,10 @@ app.get("/api/inbound/recent", requireAuth, async (req, res) => {
   if (videoId) {
     conditions.push("events.video_id = ?");
     params.push(videoId);
+  }
+  if (datasetId) {
+    conditions.push("sites.dataset_fk = ?");
+    params.push(datasetId);
   }
   if (!Number.isNaN(sinceId)) {
     conditions.push("events.id > ?");
@@ -1882,9 +2577,12 @@ app.get("/api/inbound/recent", requireAuth, async (req, res) => {
         events.trace_id,
         events.user_agent,
         events.inbound_json,
-        sites.site_key
+        sites.site_key,
+        datasets.name AS dataset_name,
+        datasets.dataset_id AS dataset_id
       FROM events
       LEFT JOIN sites ON events.site_id = sites.site_id
+      LEFT JOIN datasets ON sites.dataset_fk = datasets.id
       ${whereClause}
       ORDER BY events.id DESC
       LIMIT ?
@@ -1908,7 +2606,9 @@ app.get("/api/inbound/recent", requireAuth, async (req, res) => {
       watched_seconds: customData.watch_seconds ?? null,
       duration: customData.duration ?? null,
       trace_id: row.trace_id ?? null,
-      user_agent: row.user_agent ?? null
+      user_agent: row.user_agent ?? null,
+      dataset_name: row.dataset_name ?? null,
+      dataset_id: row.dataset_id ?? null
     };
   });
 
@@ -2087,16 +2787,31 @@ app.post("/logout", (req, res) => {
 });
 
 app.get("/dashboard", requireAuth, async (req, res) => {
-  const events24h = await countEventsSince(db, 24);
-  const errors24h = await countErrorsSince(db, 24);
-  const deduped24h = await countDedupedSince(db, 24);
+  const datasets = await listDatasets(db);
+  const selectedDatasetId = res.locals.selectedDatasetId ?? "";
+  const datasetId = selectedDatasetId || null;
+  const events24h = await countEventsSince(db, 24, datasetId);
+  const errors24h = await countErrorsSince(db, 24, datasetId);
+  const deduped24h = await countDedupedSince(db, 24, datasetId);
   const dedupRate = events24h ? Math.round((deduped24h / events24h) * 100) : 0;
-  const recentEvents = await listEvents(db, { limit: 10 });
-  const recentErrors = await listRecentErrors(db, 10);
+  const recentEvents = await listEvents(db, { limit: 10, datasetId });
+  const recentErrors = await listRecentErrors(db, 10, datasetId);
   const sites = await getSites(db);
-  const skippedCount = await db.get(
-    "SELECT COUNT(*) as count FROM events WHERE outbound_result = 'skipped' AND created_at > datetime('now', '-24 hours')"
-  );
+  const skippedCount = datasetId
+    ? await db.get(
+        `
+          SELECT COUNT(*) as count
+          FROM events
+          LEFT JOIN sites ON events.site_id = sites.site_id
+          WHERE events.outbound_result = 'skipped'
+            AND events.created_at > datetime('now', '-24 hours')
+            AND sites.dataset_fk = ?
+        `,
+        datasetId
+      )
+    : await db.get(
+        "SELECT COUNT(*) as count FROM events WHERE outbound_result = 'skipped' AND created_at > datetime('now', '-24 hours')"
+      );
   const banners = [];
   if (req.session.mustChangePassword) {
     banners.push(`<div class="banner warning">Default credentials in use. Update your password in Settings.</div>`);
@@ -2108,10 +2823,18 @@ app.get("/dashboard", requireAuth, async (req, res) => {
     banners.push(`<div class="banner info">Events are being logged but not forwarded.</div>`);
   }
 
+  const datasetOptions = buildDatasetOptions(datasets, selectedDatasetId);
   const body = `
     <div class="card">
       <h1>Dashboard</h1>
       <p class="muted">Gateway status and recent activity snapshot.</p>
+      <form method="get" action="/dashboard" class="inline-form">
+        <label>Dataset
+          <select name="dataset" onchange="this.form.submit()">
+            ${datasetOptions}
+          </select>
+        </label>
+      </form>
     </div>
     ${banners.join("")}
     <div class="grid">
@@ -2141,7 +2864,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
             <th>Time</th>
             <th>Site</th>
             <th>Event</th>
-            <th>Pixel</th>
+            <th>Dataset</th>
             <th>Status</th>
           </tr>
         </thead>
@@ -2153,7 +2876,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
               <td>${formatDate(event.received_at_utc_ms ?? event.received_at ?? event.created_at)}</td>
               <td>${event.site_name ?? "—"}</td>
               <td><a href="/dashboard/events/${event.id}">${event.event_name ?? "—"}</a></td>
-              <td>${event.pixel_id ?? "—"}</td>
+              <td>${escapeHtml(formatDatasetLabel(event))}</td>
               <td>${renderStatusPill(resolveOutboundStatus(event.outbound_result) || event.status)}</td>
             </tr>
           `
@@ -2169,6 +2892,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
             <th>Type</th>
             <th>Message</th>
             <th>Site</th>
+            <th>Dataset</th>
           </tr>
         </thead>
         <tbody id="recent-errors-body">
@@ -2182,6 +2906,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
               <td>${escapeHtml(error.type ?? "—")}</td>
               <td title="${escapeHtml(message)}">${escapeHtml(truncated)}</td>
               <td>${escapeHtml(error.site_name ?? "—")}</td>
+              <td>${escapeHtml(formatDatasetLabel(error))}</td>
             </tr>
           `;
             })
@@ -2206,6 +2931,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
             <th>ID</th>
             <th>Time</th>
             <th>Site Key</th>
+            <th>Dataset</th>
             <th>Video</th>
             <th>Event</th>
             <th>%</th>
@@ -2227,6 +2953,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
       const recentActivityBody = document.getElementById('recent-activity-body');
       const recentErrorsBody = document.getElementById('recent-errors-body');
       const liveTimeZone = ${JSON.stringify(cachedTimeZone)};
+      const dashboardDatasetId = ${JSON.stringify(selectedDatasetId)};
       let lastRenderedId = null;
 
       function formatDashboardTime(value) {
@@ -2256,6 +2983,12 @@ app.get("/dashboard", requireAuth, async (req, res) => {
         return cell;
       }
 
+      function formatDatasetLabel(item) {
+        const name = item.dataset_name || 'Dataset';
+        const id = item.dataset_id || '—';
+        return name + ' (' + id + ')';
+      }
+
       function createStatusPill(status) {
         const normalized = status || 'unknown';
         const pill = document.createElement('span');
@@ -2280,7 +3013,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
         link.textContent = event.event_name || '—';
         eventCell.appendChild(link);
         tr.appendChild(eventCell);
-        tr.appendChild(createCell(event.pixel_id));
+        tr.appendChild(createCell(formatDatasetLabel(event)));
         const statusCell = document.createElement('td');
         statusCell.appendChild(createStatusPill(event.status));
         tr.appendChild(statusCell);
@@ -2297,13 +3030,15 @@ app.get("/dashboard", requireAuth, async (req, res) => {
         messageCell.title = message;
         tr.appendChild(messageCell);
         tr.appendChild(createCell(error.site_name));
+        tr.appendChild(createCell(formatDatasetLabel(error)));
         return tr;
       }
 
       async function loadRecentActivity() {
+        const datasetQuery = dashboardDatasetId ? '&dataset_id=' + encodeURIComponent(dashboardDatasetId) : '';
         const [eventsResponse, errorsResponse] = await Promise.all([
-          fetch('/api/events/recent?limit=10'),
-          fetch('/api/errors/recent?limit=10')
+          fetch('/api/events/recent?limit=10' + datasetQuery),
+          fetch('/api/errors/recent?limit=10' + datasetQuery)
         ]);
         const eventsPayload = await eventsResponse.json();
         if (eventsPayload && eventsPayload.ok && recentActivityBody) {
@@ -2324,6 +3059,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
         tr.appendChild(createCell(row.id));
         tr.appendChild(createCell(formatInboundTime(row.ts)));
         tr.appendChild(createCell(row.site_key));
+        tr.appendChild(createCell(formatDatasetLabel(row)));
         tr.appendChild(createCell(row.video_id));
         tr.appendChild(createCell(row.event_name));
         tr.appendChild(createCell(row.percent));
@@ -2344,6 +3080,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
 
       async function loadInbound() {
         const params = new URLSearchParams({ limit: '50' });
+        if (dashboardDatasetId) params.set('dataset_id', dashboardDatasetId);
         if (lastRenderedId) params.set('since_id', lastRenderedId);
         const response = await fetch('/api/inbound/recent?' + params.toString());
         const payload = await response.json();
@@ -2374,7 +3111,10 @@ app.get("/dashboard", requireAuth, async (req, res) => {
 });
 
 app.get("/dashboard/sites", requireAuth, async (req, res) => {
-  const sites = await getSites(db);
+  const datasets = await listDatasets(db);
+  const selectedDatasetId = res.locals.selectedDatasetId ?? "";
+  const datasetId = selectedDatasetId || null;
+  const sites = datasetId ? await listSitesByDataset(db, datasetId) : await getSites(db);
   const skippedCount = await db.get(
     "SELECT COUNT(*) as count FROM events WHERE outbound_result = 'skipped' AND created_at > datetime('now', '-24 hours')"
   );
@@ -2389,11 +3129,14 @@ app.get("/dashboard/sites", requireAuth, async (req, res) => {
     banners.push(`<div class="banner info">Events are being logged but not forwarded.</div>`);
   }
 
+  const datasetFilterOptions = buildDatasetOptions(datasets, selectedDatasetId);
   const siteCards = await Promise.all(
     sites.map(async site => {
       const eventsToday = await countEventsTodayBySite(db, site.site_id);
       const errorsToday = await countErrorsTodayBySite(db, site.site_id);
       const status = renderSiteStatus(site);
+      const datasetLabel = formatDatasetLabelFromSite(site);
+      const datasetQuery = datasetId ? `&dataset=${encodeURIComponent(datasetId)}` : "";
       return `
         <div class="card site-card">
           <div class="site-header">
@@ -2401,7 +3144,7 @@ app.get("/dashboard/sites", requireAuth, async (req, res) => {
               <h3>${site.name ?? "Untitled site"}</h3>
               ${status}
             </div>
-            <span class="muted">Pixel ${site.pixel_id ?? "—"}</span>
+            <span class="muted">Dataset ${escapeHtml(datasetLabel)}</span>
           </div>
           <p class="muted">Site ID: <code>${site.site_id}</code></p>
           <p class="muted">Site Key: <code>${site.site_key}</code></p>
@@ -2416,7 +3159,7 @@ app.get("/dashboard/sites", requireAuth, async (req, res) => {
             </div>
           </div>
           <div class="actions">
-            <a class="button" href="/dashboard/live?site=${site.site_id}">View Events</a>
+            <a class="button" href="/dashboard/live?site=${site.site_id}${datasetQuery}">View Events</a>
             <a class="button secondary" href="/dashboard/sites/${site.site_id}">Edit Settings</a>
             <a class="button secondary" href="/dashboard/sites/${site.site_id}#test-event">Send Test Event</a>
           </div>
@@ -2426,25 +3169,36 @@ app.get("/dashboard/sites", requireAuth, async (req, res) => {
   );
 
   const notice = req.query.notice ? `<div class="banner info">${req.query.notice}</div>` : "";
+  const datasetOptions = buildDatasetOptions(datasets, "", { includeAll: false });
 
   const body = `
     <div class="card">
       <h1>Sites</h1>
-      <p class="muted">Manage site keys, Meta pixel credentials, and debug toggles.</p>
+      <p class="muted">Manage site keys, dataset assignment, and debug toggles.</p>
     </div>
     ${banners.join("")}
     ${notice}
+    <div class="card">
+      <form method="get" action="/dashboard/sites" class="form-grid">
+        <label>Dataset
+          <select name="dataset">
+            ${datasetFilterOptions}
+          </select>
+        </label>
+        <button type="submit">Filter</button>
+      </form>
+    </div>
     <div class="card">
       <h2>Create site</h2>
       <form method="post" action="/dashboard/sites" class="form-grid">
         <label>Name
           <input name="name" required />
         </label>
-        <label>Pixel ID
-          <input name="pixel_id" />
-        </label>
-        <label>Access Token
-          <input name="access_token" />
+        <label>Dataset
+          <select name="dataset_fk" required>
+            <option value="">Select a dataset</option>
+            ${datasetOptions}
+          </select>
         </label>
         <label>Test Event Code
           <input name="test_event_code" />
@@ -2486,7 +3240,9 @@ app.get("/dashboard/sites/:siteId", requireAuth, async (req, res) => {
 
   const status = renderSiteStatus(site);
   const accessToken = resolveAccessToken(site);
-  const maskedToken = accessToken ? maskToken(accessToken) : site.access_token ? "Encrypted" : "—";
+  const maskedToken = accessToken ? maskTokenTail(accessToken) : site.dataset_access_token ? "Encrypted" : "—";
+  const datasets = await listDatasets(db);
+  const datasetOptions = buildDatasetOptions(datasets, site.dataset_fk, { includeAll: false });
   const testEventOptions = TEST_EVENT_TYPES.map(
     type => `<option value="${type}">${type}</option>`
   ).join("");
@@ -2494,8 +3250,9 @@ app.get("/dashboard/sites/:siteId", requireAuth, async (req, res) => {
   const body = `
     <div class="card">
       <h1>${site.name ?? "Site settings"}</h1>
-      <p class="muted">Manage ingest auth, Meta config, and debug toggles.</p>
+      <p class="muted">Manage ingest auth, dataset assignment, and debug toggles.</p>
       <div class="inline">${status}</div>
+      <p class="muted">Dataset: ${escapeHtml(formatDatasetLabelFromSite(site))}</p>
     </div>
     <div class="card">
       <h2>Ingest auth</h2>
@@ -2508,21 +3265,16 @@ app.get("/dashboard/sites/:siteId", requireAuth, async (req, res) => {
       </div>
     </div>
     <div class="card">
-      <h2>Meta config</h2>
+      <h2>Dataset assignment</h2>
       <form method="post" action="/dashboard/sites/${site.site_id}" class="form-grid">
         <label>Name
           <input name="name" value="${site.name ?? ""}" />
         </label>
-        <label>Pixel ID
-          <input name="pixel_id" value="${site.pixel_id ?? ""}" />
-        </label>
-        <label>Access Token
-          <input name="access_token" placeholder="Enter new access token" />
-          <span class="muted">Stored token: ${maskedToken}</span>
-        </label>
-        <label class="checkbox">
-          <input type="checkbox" name="clear_access_token" />
-          Clear access token
+        <label>Dataset
+          <select name="dataset_fk" required>
+            ${datasetOptions}
+          </select>
+          <span class="muted">Dataset access token: ${maskedToken}</span>
         </label>
         <label>Test Event Code
           <input name="test_event_code" value="${site.test_event_code ?? ""}" />
@@ -2555,7 +3307,7 @@ app.get("/dashboard/sites/:siteId", requireAuth, async (req, res) => {
       <div id="test-event-warning" class="banner warning hidden"></div>
       <form id="test-event-form" class="form-grid"
         data-site-id="${site.site_id}"
-        data-has-credentials="${Boolean(site.pixel_id && accessToken)}"
+        data-has-credentials="${Boolean(site.dataset_id && accessToken)}"
         data-has-test-event-code="${Boolean(site.test_event_code)}"
         data-send-to-meta="${Boolean(site.send_to_meta)}"
         data-dry-run="${Boolean(site.dry_run)}">
@@ -2707,7 +3459,7 @@ app.get("/dashboard/sites/:siteId", requireAuth, async (req, res) => {
         const hasCredentials = testForm.dataset.hasCredentials === 'true';
         const hasTestEventCode = testForm.dataset.hasTestEventCode === 'true';
         if (!hasCredentials) {
-          setWarning('Missing credentials. Add a Pixel ID and Access Token above to send test events.');
+          setWarning('Missing credentials. Add dataset credentials in Datasets to send test events.');
           return;
         }
         if (!hasTestEventCode) {
@@ -2774,9 +3526,11 @@ app.get("/dashboard/sites/:siteId", requireAuth, async (req, res) => {
           renderResult(result);
 
           if (result.reason === 'missing_credentials') {
-            setWarning('Missing credentials. Add a Pixel ID and Access Token above to send test events.');
+            setWarning('Missing credentials. Add dataset credentials in Datasets to send test events.');
           } else if (result.reason === 'missing_test_event_code') {
             setWarning('Missing test event code. Find it in Events Manager → Test Events.');
+          } else if (result.reason === 'dataset_inactive') {
+            setWarning('Dataset is disabled. Enable it to send test events.');
           } else if (result.reason === 'dry_run') {
             setWarning('Dry-run is enabled. Disable dry-run to send test events.');
           } else if (result.reason === 'send_disabled') {
@@ -2812,9 +3566,11 @@ app.get("/dashboard/sites/:siteId", requireAuth, async (req, res) => {
           testPingStatus.textContent = result.forwarded === false ? 'Skipped' : 'Sent';
           testPingTrace.textContent = fbtraceId ? 'fbtrace_id: ' + fbtraceId : '';
           if (result.reason === 'missing_credentials') {
-            setWarning('Missing credentials. Add a Pixel ID and Access Token above to send test events.');
+            setWarning('Missing credentials. Add dataset credentials in Datasets to send test events.');
           } else if (result.reason === 'missing_test_event_code') {
             setWarning('Missing test event code. Find it in Events Manager → Test Events.');
+          } else if (result.reason === 'dataset_inactive') {
+            setWarning('Dataset is disabled. Enable it to send test events.');
           } else if (result.reason === 'dry_run') {
             setWarning('Dry-run is enabled. Disable dry-run to send test events.');
           } else if (result.reason === 'send_disabled') {
@@ -2840,18 +3596,27 @@ app.get("/dashboard/sites/:siteId", requireAuth, async (req, res) => {
 });
 
 app.post("/dashboard/sites", requireAuth, async (req, res) => {
+  const datasetId = Number.parseInt(req.body.dataset_fk ?? "", 10);
+  const dataset = Number.isNaN(datasetId) ? null : await getDatasetById(db, datasetId);
+  if (!dataset) {
+    return res.status(400).send(renderPage({
+      title: "Invalid dataset",
+      body: `<div class="card"><h1>Invalid dataset</h1><p class="muted">Select a valid dataset.</p></div>`
+    }));
+  }
   const site_id = uuid();
   const site_key = uuid();
   await createSite(db, {
     site_id,
     site_key,
     name: req.body.name || "Untitled site",
-    pixel_id: req.body.pixel_id || null,
-    access_token: encryptToken(req.body.access_token || null),
+    pixel_id: null,
+    access_token: null,
     test_event_code: req.body.test_event_code || null,
     send_to_meta: Boolean(req.body.send_to_meta),
     dry_run: req.body.dry_run === undefined ? true : Boolean(req.body.dry_run),
-    log_full_payloads: req.body.log_full_payloads !== undefined
+    log_full_payloads: req.body.log_full_payloads !== undefined,
+    dataset_fk: dataset.id
   });
   await log({ type: "admin", message: "site created", site_id });
   res.redirect("/dashboard/sites");
@@ -2866,18 +3631,24 @@ app.post("/dashboard/sites/:siteId", requireAuth, async (req, res) => {
       body: `<div class="card"><h1>Site not found</h1></div>`
     }));
   }
-  const accessToken = req.body.clear_access_token
-    ? null
-    : req.body.access_token || existing.access_token;
+  const datasetId = Number.parseInt(req.body.dataset_fk ?? "", 10);
+  const dataset = Number.isNaN(datasetId) ? null : await getDatasetById(db, datasetId);
+  if (!dataset) {
+    return res.status(400).send(renderPage({
+      title: "Invalid dataset",
+      body: `<div class="card"><h1>Invalid dataset</h1><p class="muted">Select a valid dataset.</p></div>`
+    }));
+  }
   await updateSite(db, {
     site_id,
     name: req.body.name,
-    pixel_id: req.body.pixel_id || null,
-    access_token: encryptToken(accessToken),
+    pixel_id: existing.pixel_id ?? null,
+    access_token: existing.access_token ?? null,
     test_event_code: req.body.test_event_code || null,
     send_to_meta: Boolean(req.body.send_to_meta),
     dry_run: Boolean(req.body.dry_run),
-    log_full_payloads: req.body.log_full_payloads !== undefined
+    log_full_payloads: req.body.log_full_payloads !== undefined,
+    dataset_fk: dataset.id
   });
   await log({ type: "admin", message: "site updated", site_id });
   res.redirect(`/dashboard/sites/${site_id}`);
@@ -2937,8 +3708,12 @@ app.post("/dashboard/sites/:siteId/delete", requireAuth, async (req, res) => {
 });
 
 app.get("/dashboard/videos", requireAuth, async (req, res) => {
-  const videos = await listVideos(db);
+  const datasets = await listDatasets(db);
+  const selectedDatasetId = res.locals.selectedDatasetId ?? "";
+  const datasetId = selectedDatasetId || null;
+  const videos = datasetId ? await listVideosByDataset(db, datasetId) : await listVideos(db);
   const host = resolveSnippetBaseUrl(req);
+  const datasetFilterOptions = buildDatasetOptions(datasets, selectedDatasetId);
 
   const rows = videos.map(video => {
     const snippet = buildVideoSnippet({
@@ -2952,6 +3727,7 @@ app.get("/dashboard/videos", requireAuth, async (req, res) => {
     const providerLabel = formatVideoProvider(video.provider);
     const providerDetails = video.provider_video_id ? `${providerLabel} (${video.provider_video_id})` : providerLabel;
     const sourceUrl = video.video_source_url || "";
+    const datasetQuery = datasetId ? `&dataset=${encodeURIComponent(datasetId)}` : "";
     return `
       <tr>
         <td>
@@ -2959,6 +3735,7 @@ app.get("/dashboard/videos", requireAuth, async (req, res) => {
           <span class="muted">${video.name ?? "—"}</span>
         </td>
         <td>${video.site_name ?? "—"}</td>
+        <td>${escapeHtml(formatDatasetLabel(video))}</td>
         <td>${video.page_url ?? "—"}</td>
         <td>
           <span class="pill pill-provider">${providerDetails || "Unknown"}</span>
@@ -2977,7 +3754,7 @@ app.get("/dashboard/videos", requireAuth, async (req, res) => {
         <td>
           <div class="actions">
             <a class="button secondary" href="/dashboard/videos/${video.id}">Edit</a>
-            <a class="button secondary" href="/dashboard/live?site=${video.site_id}&video_id=${video.video_id}">View Events</a>
+            <a class="button secondary" href="/dashboard/live?site=${video.site_id}&video_id=${video.video_id}${datasetQuery}">View Events</a>
             <button class="button secondary copy-snippet" data-snippet="${encodedSnippet}">Copy Snippet</button>
             <form method="post" action="/dashboard/videos/${video.id}/toggle">
               <button type="submit" class="${video.enabled ? "danger" : ""}">${video.enabled ? "Disable" : "Enable"}</button>
@@ -3000,12 +3777,23 @@ app.get("/dashboard/videos", requireAuth, async (req, res) => {
     </div>
     ${notice}
     <div class="card">
+      <form method="get" action="/dashboard/videos" class="form-grid">
+        <label>Dataset
+          <select name="dataset">
+            ${datasetFilterOptions}
+          </select>
+        </label>
+        <button type="submit">Filter</button>
+      </form>
+    </div>
+    <div class="card">
       <h2>Tracked videos</h2>
       <table>
         <thead>
           <tr>
             <th>Video</th>
             <th>Site</th>
+            <th>Dataset</th>
             <th>Page URL</th>
             <th>Provider</th>
             <th>Video Source URL</th>
@@ -3015,7 +3803,7 @@ app.get("/dashboard/videos", requireAuth, async (req, res) => {
           </tr>
         </thead>
         <tbody>
-          ${rows.join("") || "<tr><td colspan=\"8\" class=\"muted\">No videos yet.</td></tr>"}
+          ${rows.join("") || "<tr><td colspan=\"9\" class=\"muted\">No videos yet.</td></tr>"}
         </tbody>
       </table>
     </div>
@@ -3066,7 +3854,7 @@ app.get("/dashboard/videos", requireAuth, async (req, res) => {
 app.get("/dashboard/videos/new", requireAuth, async (req, res) => {
   const sites = await getSites(db);
   const siteOptions = sites
-    .map(site => `<option value="${site.site_id}">${site.name ?? site.site_id}</option>`)
+    .map(site => `<option value="${site.site_id}">${site.name ?? site.site_id} · ${escapeHtml(formatDatasetLabelFromSite(site))}</option>`)
     .join("");
   const warning = req.query.warning ? `<div class="banner warning">${req.query.warning}</div>` : "";
 
@@ -3184,7 +3972,7 @@ app.get("/dashboard/videos/:videoDbId", requireAuth, async (req, res) => {
   const activeSite = await getSiteById(db, video.site_id);
   const sites = await getSites(db);
   const siteOptions = sites
-    .map(site => `<option value="${site.site_id}" ${site.site_id === video.site_id ? "selected" : ""}>${site.name ?? site.site_id}</option>`)
+    .map(site => `<option value="${site.site_id}" ${site.site_id === video.site_id ? "selected" : ""}>${site.name ?? site.site_id} · ${escapeHtml(formatDatasetLabelFromSite(site))}</option>`)
     .join("");
   const host = resolveSnippetBaseUrl(req);
   const snippet = buildVideoSnippet({
@@ -3427,9 +4215,12 @@ app.post("/dashboard/videos/:videoDbId/delete", requireAuth, async (req, res) =>
 
 app.get("/dashboard/live", requireAuth, async (req, res) => {
   const sites = await getSites(db);
+  const datasets = await listDatasets(db);
+  const selectedDatasetId = res.locals.selectedDatasetId ?? "";
   const siteOptions = sites
-    .map(site => `<option value="${site.site_id}">${site.name ?? site.site_id}</option>`)
+    .map(site => `<option value="${site.site_id}">${site.name ?? site.site_id} · ${escapeHtml(formatDatasetLabelFromSite(site))}</option>`)
     .join("");
+  const datasetOptions = buildDatasetOptions(datasets, selectedDatasetId);
   const dateFilterActive =
     req.query.today === "1" || req.query.today === "true" || req.query.today === "yes";
   const timeZoneLabel = cachedTimeZone || DEFAULT_TIME_ZONE;
@@ -3450,6 +4241,11 @@ app.get("/dashboard/live", requireAuth, async (req, res) => {
     <div class="split-pane">
       <section class="pane pane-list">
         <div class="filters">
+          <label>Dataset
+            <select id="filter-dataset">
+              ${datasetOptions}
+            </select>
+          </label>
           <label>Site
             <select id="filter-site">
               <option value="">All sites</option>
@@ -3492,6 +4288,7 @@ app.get("/dashboard/live", requireAuth, async (req, res) => {
       const timeZone = ${JSON.stringify(cachedTimeZone)};
       const streamEl = document.getElementById('event-stream');
       const detailEl = document.getElementById('event-detail');
+      const filterDataset = document.getElementById('filter-dataset');
       const filterSite = document.getElementById('filter-site');
       const filterType = document.getElementById('filter-type');
       const filterVideo = document.getElementById('filter-video');
@@ -3500,6 +4297,7 @@ app.get("/dashboard/live", requireAuth, async (req, res) => {
 
       function buildQuery() {
         const params = new URLSearchParams();
+        if (filterDataset.value) params.set('dataset', filterDataset.value);
         if (filterSite.value) params.set('site', filterSite.value);
         if (filterType.value) params.set('event_type', filterType.value);
         if (filterVideo.value) params.set('video_id', filterVideo.value);
@@ -3542,6 +4340,9 @@ app.get("/dashboard/live", requireAuth, async (req, res) => {
         const outboundStatus = event.outbound_result ? 'outbound_' + event.outbound_result : (event.status || '');
         row.className = 'event-row ' + outboundStatus;
         row.dataset.id = event.id;
+        const datasetLabel = event.dataset_name && event.dataset_id
+          ? event.dataset_name + ' (' + event.dataset_id + ')'
+          : 'Dataset —';
         const inboundBits = [];
         if (event.video_id) {
           inboundBits.push('Video ' + event.video_id);
@@ -3570,7 +4371,7 @@ app.get("/dashboard/live", requireAuth, async (req, res) => {
         row.innerHTML =
           '<div>' +
             '<strong>' + (event.event_name || '—') + '</strong>' +
-            '<div class="muted">' + (event.site_name || 'Unknown site') + '</div>' +
+            '<div class="muted">' + (event.site_name || 'Unknown site') + ' · ' + datasetLabel + '</div>' +
             inboundLine +
             sourceLine +
             duplicateLine +
@@ -3611,6 +4412,9 @@ app.get("/dashboard/live", requireAuth, async (req, res) => {
         const outboundBadge = '<span class="pill pill-' + outboundStatusClass + '"' +
           (outboundReason ? ' title="' + outboundReason + '"' : '') +
           '>' + outboundStatusDisplay + '</span>';
+        const datasetLabel = event.dataset_name && event.dataset_id
+          ? event.dataset_name + ' (' + event.dataset_id + ')'
+          : 'Dataset —';
         const inboundMeta = [
           event.video_id ? 'Video ID: <strong>' + event.video_id + '</strong>' : null,
           event.percent !== null && event.percent !== undefined ? 'Percent: <strong>' + event.percent + '%</strong>' : null,
@@ -3624,7 +4428,7 @@ app.get("/dashboard/live", requireAuth, async (req, res) => {
           '<div class="detail-header">' +
             '<div>' +
               '<h2>' + (event.event_name || 'Event detail') + '</h2>' +
-              '<p class="muted">' + (event.site_name || 'Unknown site') + ' · ' + (event.pixel_id || 'No pixel') + ' · ' + formatEventDate(timestamp) + '</p>' +
+              '<p class="muted">' + (event.site_name || 'Unknown site') + ' · ' + datasetLabel + ' · ' + formatEventDate(timestamp) + '</p>' +
               videoModeLine +
               (inboundMeta ? '<p class="muted">' + inboundMeta + '</p>' : '') +
               duplicateSummary +
@@ -3665,7 +4469,7 @@ app.get("/dashboard/live", requireAuth, async (req, res) => {
         });
       }
 
-      [filterSite, filterType, filterStatus].forEach(el => el.addEventListener('change', loadStream));
+      [filterDataset, filterSite, filterType, filterStatus].forEach(el => el.addEventListener('change', loadStream));
       filterVideo.addEventListener('input', () => {
         if (filterVideo.value.length === 0 || filterVideo.value.length > 2) {
           loadStream();
@@ -3702,7 +4506,7 @@ app.get("/dashboard/events/:eventId", requireAuth, async (req, res) => {
   const body = `
     <div class="card">
       <h1>${maskedEvent.event_name ?? "Event detail"}</h1>
-      <p class="muted">${maskedEvent.site_name ?? "Unknown site"} · ${maskedEvent.pixel_id ?? "No pixel"} · ${formatDate(maskedEvent.received_at_utc_ms ?? maskedEvent.received_at ?? maskedEvent.created_at)}</p>
+      <p class="muted">${maskedEvent.site_name ?? "Unknown site"} · ${escapeHtml(formatDatasetLabel(maskedEvent))} · ${formatDate(maskedEvent.received_at_utc_ms ?? maskedEvent.received_at ?? maskedEvent.created_at)}</p>
       <p class="muted">Event ID: <code>${maskedEvent.event_id ?? "—"}</code></p>
       ${maskedEvent.video_id ? `<p class="muted">Video ID: <code>${maskedEvent.video_id}</code> · ${maskedEvent.percent ?? "—"}%</p>` : ""}
       ${maskedEvent.video_mode ? `<p class="muted">Video mode: <strong>${maskedEvent.video_mode}</strong></p>` : ""}
@@ -3728,11 +4532,14 @@ app.get("/dashboard/events/:eventId", requireAuth, async (req, res) => {
 
 app.get("/dashboard/errors", requireAuth, async (req, res) => {
   const selectedType = req.query.type ?? "";
-  const groups = await listErrorGroups(db);
+  const datasets = await listDatasets(db);
+  const selectedDatasetId = res.locals.selectedDatasetId ?? "";
+  const datasetId = selectedDatasetId || null;
+  const groups = await listErrorGroups(db, datasetId);
   const limit = 50;
   const errors = selectedType
-    ? await listErrors(db, { type: selectedType, limit })
-    : await listRecentErrors(db, limit);
+    ? await listErrors(db, { type: selectedType, limit, datasetId })
+    : await listRecentErrors(db, limit, datasetId);
 
   const typeOptions = [
     `<option value="" ${selectedType ? "" : "selected"}>All types</option>`,
@@ -3742,6 +4549,7 @@ app.get("/dashboard/errors", requireAuth, async (req, res) => {
     })
   ].join("");
 
+  const datasetOptions = buildDatasetOptions(datasets, selectedDatasetId);
   const body = `
     <div class="card">
       <h1>Errors</h1>
@@ -3749,6 +4557,11 @@ app.get("/dashboard/errors", requireAuth, async (req, res) => {
     </div>
     <div class="card">
       <form method="get" action="/dashboard/errors" class="form-grid">
+        <label>Dataset
+          <select name="dataset">
+            ${datasetOptions}
+          </select>
+        </label>
         <label>Error type
           <select name="type">
             ${typeOptions}
@@ -3764,6 +4577,7 @@ app.get("/dashboard/errors", requireAuth, async (req, res) => {
             <th>Time</th>
             <th>Type</th>
             <th>Site</th>
+            <th>Dataset</th>
             <th>Message</th>
             <th>Event</th>
             <th>Meta Status</th>
@@ -3781,6 +4595,7 @@ app.get("/dashboard/errors", requireAuth, async (req, res) => {
               <td>${formatDate(error.created_at)}</td>
               <td>${escapeHtml(error.type ?? "—")}</td>
               <td>${escapeHtml(error.site_name ?? "—")}</td>
+              <td>${escapeHtml(formatDatasetLabel(error))}</td>
               <td title="${escapeHtml(message)}">${escapeHtml(message)}</td>
               <td>${eventLink}</td>
               <td>${escapeHtml(error.meta_status ?? "—")}</td>
@@ -3918,6 +4733,7 @@ app.get("/admin/events", requireAuth, async (req, res) => {
   const events = await listEvents(db, {
     limit: Number.isNaN(limit) ? 50 : limit,
     siteId: req.query.site || undefined,
+    datasetId: req.query.dataset || undefined,
     status: req.query.status || undefined,
     eventName: req.query.event_name || undefined,
     videoId: req.query.video_id || undefined,
@@ -4123,6 +4939,8 @@ app.post("/v/track", publicCors, async (req, res) => {
       await markInboundDuplicate(db, inboundId, duplicateCount);
       await insertOutboundLog(db, {
         inbound_id: inboundId,
+        dataset_fk: site.dataset_fk ?? null,
+        dataset_id: site.dataset_id ?? null,
         mode_used: mode,
         request_payload_json: JSON.stringify({
           data: [sanitizePayload(inboundEvent, site.log_full_payloads === 1)]
@@ -4170,6 +4988,9 @@ app.post("/v/track", publicCors, async (req, res) => {
   });
 
   const accessToken = resolveAccessToken(site);
+  const datasetId = site.dataset_id ?? null;
+  const datasetFk = site.dataset_fk ?? null;
+  const datasetInactive = site.dataset_is_active === 0;
   const shouldSendToMeta = site.send_to_meta && !site.dry_run;
   let outboundResult = "skipped";
   let outboundReason = null;
@@ -4185,7 +5006,9 @@ app.post("/v/track", publicCors, async (req, res) => {
     outboundReason = site.dry_run ? "dry_run" : "send_disabled";
   } else if (!isTest && mode === "off") {
     outboundReason = "video_mode_off";
-  } else if (!site.pixel_id || !accessToken) {
+  } else if (datasetInactive) {
+    outboundReason = "dataset_inactive";
+  } else if (!datasetId || !accessToken) {
     outboundReason = "missing_meta_credentials";
   } else if (!testEventCode && mode === "test") {
     outboundReason = "missing_test_event_code";
@@ -4193,7 +5016,7 @@ app.post("/v/track", publicCors, async (req, res) => {
     outboundReason = "insufficient_user_data";
   } else {
     const apiVersion = await getSettingValue("default_meta_api_version", "v24.0");
-    const url = `https://graph.facebook.com/${apiVersion}/${site.pixel_id}/events?access_token=${accessToken}`;
+    const url = `https://graph.facebook.com/${apiVersion}/${datasetId}/events?access_token=${accessToken}`;
     try {
       const retryCount = await getSettingNumber("retry_count", 1);
       const { response, body } = await sendToMeta({ url, payload: outboundPayload, retryCount });
@@ -4207,6 +5030,8 @@ app.post("/v/track", publicCors, async (req, res) => {
       );
       await insertOutboundLog(db, {
         inbound_id: inboundId,
+        dataset_fk: datasetFk,
+        dataset_id: datasetId,
         mode_used: mode,
         request_payload_json: outboundLogPayload,
         http_status: status,
@@ -4255,6 +5080,8 @@ app.post("/v/track", publicCors, async (req, res) => {
       forwarded = false;
       await insertOutboundLog(db, {
         inbound_id: inboundId,
+        dataset_fk: datasetFk,
+        dataset_id: datasetId,
         mode_used: mode,
         request_payload_json: outboundLogPayload,
         result: outboundResult,
@@ -4276,6 +5103,8 @@ app.post("/v/track", publicCors, async (req, res) => {
   if (outboundReason && !outboundLogged) {
     await insertOutboundLog(db, {
       inbound_id: inboundId,
+      dataset_fk: datasetFk,
+      dataset_id: datasetId,
       mode_used: mode,
       request_payload_json: outboundLogPayload,
       result: outboundResult,
@@ -4438,8 +5267,10 @@ app.post("/collect", publicCors, async (req, res) => {
   };
 
   const accessToken = resolveAccessToken(site);
+  const datasetId = site.dataset_id ?? null;
+  const datasetInactive = site.dataset_is_active === 0;
   const apiVersion = await getSettingValue("default_meta_api_version", "v24.0");
-  const url = `https://graph.facebook.com/${apiVersion}/${site.pixel_id}/events?access_token=${accessToken}`;
+  const url = `https://graph.facebook.com/${apiVersion}/${datasetId}/events?access_token=${accessToken}`;
 
   const outboundLog = JSON.stringify({
     ...payload,
@@ -4447,7 +5278,7 @@ app.post("/collect", publicCors, async (req, res) => {
   });
   const inboundLog = JSON.stringify(sanitizePayload(inboundEvent, site.log_full_payloads === 1));
 
-  if (!site.pixel_id || !accessToken) {
+  if (!datasetId || !accessToken) {
     const eventDbId = await insertEvent(db, {
       ...baseInsertPayload,
       status: "outbound_skipped",
@@ -4459,6 +5290,20 @@ app.post("/collect", publicCors, async (req, res) => {
     await cleanupRetention(db, await getSettingNumber("log_retention_hours", 168));
     await log({ type: "event", site_id: site.site_id, message: "missing credentials", event_db_id: eventDbId });
     return res.json({ ok: true, forwarded: false, reason: "missing_credentials" });
+  }
+
+  if (datasetInactive) {
+    const eventDbId = await insertEvent(db, {
+      ...baseInsertPayload,
+      status: "outbound_skipped",
+      inbound_json: inboundLog,
+      outbound_json: outboundLog,
+      meta_status: 0,
+      meta_body: JSON.stringify({ reason: "dataset_inactive" })
+    });
+    await cleanupRetention(db, await getSettingNumber("log_retention_hours", 168));
+    await log({ type: "event", site_id: site.site_id, message: "dataset inactive", event_db_id: eventDbId });
+    return res.json({ ok: true, forwarded: false, reason: "dataset_inactive" });
   }
 
   if (!site.send_to_meta || site.dry_run) {
