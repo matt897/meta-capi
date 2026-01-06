@@ -332,35 +332,66 @@ const legacyPublicCors = cors({
 
 const PUBLIC_CORS_METHODS = "GET,POST,OPTIONS";
 const PUBLIC_CORS_HEADERS = "Content-Type";
+const PUBLIC_CORS_MAX_AGE = "86400";
 
 function setPublicCorsHeaders(res, origin) {
   res.set("Access-Control-Allow-Origin", origin);
   res.set("Vary", "Origin");
-  res.set("Access-Control-Allow-Credentials", "false");
   res.set("Access-Control-Allow-Methods", PUBLIC_CORS_METHODS);
   res.set("Access-Control-Allow-Headers", PUBLIC_CORS_HEADERS);
+  res.set("Access-Control-Max-Age", PUBLIC_CORS_MAX_AGE);
+}
+
+function setPublicCorsVary(res) {
+  res.set("Vary", "Origin");
+}
+
+function logCorsAllow(siteKey, origin) {
+  console.debug(`[CORS ALLOW] site_key=${siteKey} origin=${origin}`);
+}
+
+function logCorsDeny(siteKey, origin, allowed) {
+  console.log(`[CORS DENY] site_key=${siteKey ?? "unknown"} origin=${origin ?? "unknown"} allowed=${allowed ?? ""}`);
+}
+
+function getCorsSiteKey(req) {
+  if (req.method === "GET") {
+    return req.query?.site_key ?? null;
+  }
+  if (req.method === "POST") {
+    return req.body?.site_key ?? null;
+  }
+  return req.query?.site_key ?? req.body?.site_key ?? null;
 }
 
 async function publicCors(req, res, next) {
   try {
     const origin = req.get("origin");
     if (!origin) {
-      return res.status(403).json({ error: "Origin header required for CORS." });
+      setPublicCorsVary(res);
+      logCorsDeny(null, null, null);
+      return res.status(403).json({ ok: false, error: "origin_required" });
     }
-    const siteKey =
-      req.query?.site_key ?? req.body?.site_key ?? req.headers["x-site-key"];
+    const siteKey = getCorsSiteKey(req);
     if (!siteKey) {
-      return res.status(403).json({ error: "site_key required for CORS validation." });
+      setPublicCorsVary(res);
+      logCorsDeny(null, origin, null);
+      return res.status(403).json({ ok: false, error: "site_key_required" });
     }
     const site = await getSiteByKey(db, siteKey);
     if (!site) {
-      return res.status(403).json({ error: "Unknown site_key for CORS validation." });
+      setPublicCorsVary(res);
+      logCorsDeny(siteKey, origin, null);
+      return res.status(403).json({ ok: false, error: "site_key_invalid" });
     }
     const { origins } = parseAllowedOriginsInput(site.allowed_origins);
     if (!origins.includes(origin)) {
-      return res.status(403).json({ error: "Origin not allowed for this site." });
+      setPublicCorsVary(res);
+      logCorsDeny(siteKey, origin, origins.join(","));
+      return res.status(403).json({ ok: false, error: "origin_not_allowed", origin });
     }
     setPublicCorsHeaders(res, origin);
+    logCorsAllow(siteKey, origin);
     if (req.method === "OPTIONS") {
       return res.status(204).send();
     }
@@ -1397,6 +1428,7 @@ async function sendTestEvent({ site, eventType, overrides }) {
 
 app.get("/health", (req, res) => res.json({ ok: true }));
 
+app.options("/sdk/config", publicCors);
 app.get("/sdk/config", publicCors, async (req, res) => {
   const siteKey = req.query.site_key;
   const videoId = req.query.video_id;
@@ -1422,6 +1454,7 @@ app.get("/sdk/config", publicCors, async (req, res) => {
   });
 });
 
+app.options("/sdk/ping", publicCors);
 app.get("/sdk/ping", publicCors, async (req, res) => {
   const siteKey = req.query.site_key ?? null;
   const videoId = req.query.video_id ?? null;
@@ -3293,6 +3326,10 @@ app.get("/dashboard/sites", requireAuth, async (req, res) => {
         <label>Test Event Code
           <input name="test_event_code" />
         </label>
+        <label>Allowed origins
+          <textarea name="allowed_origins" rows="3" placeholder="https://example.com"></textarea>
+          <span class="muted">One origin per line or comma-separated. Example: https://example.com, https://www.example.com</span>
+        </label>
         <label class="checkbox">
           <input type="checkbox" name="send_to_meta" />
           Send to Meta when credentials are ready
@@ -3372,7 +3409,7 @@ app.get("/dashboard/sites/:siteId", requireAuth, async (req, res) => {
         </label>
         <label>Allowed origins
           <textarea name="allowed_origins" rows="3" placeholder="https://example.com">${allowedOriginsValue}</textarea>
-          <span class="muted">Comma or newline separated list of allowed origins for SDK calls.</span>
+          <span class="muted">One origin per line or comma-separated. Example: https://example.com, https://www.example.com</span>
           <div class="inline">
             <button type="button" class="secondary" id="copy-origin">Copy current origin</button>
             <span class="muted" id="copy-origin-status"></span>
@@ -3738,6 +3775,23 @@ app.post("/dashboard/sites", requireAuth, async (req, res) => {
       body: `<div class="card"><h1>Invalid dataset</h1><p class="muted">Select a valid dataset.</p></div>`
     }));
   }
+  const { origins: allowedOrigins, invalid: invalidOrigins } = parseAllowedOriginsInput(
+    req.body.allowed_origins
+  );
+  if (invalidOrigins.length > 0) {
+    const invalidList = invalidOrigins.map(origin => escapeHtml(origin)).join(", ");
+    return res.status(400).send(renderPage({
+      title: "Invalid allowed origins",
+      body: `
+        <div class="card">
+          <h1>Invalid allowed origins</h1>
+          <p class="muted">Each entry must be a full origin like <code>https://example.com</code>.</p>
+          <p>Invalid entries: ${invalidList}</p>
+          <p><a href="/dashboard/sites">Return to sites</a></p>
+        </div>
+      `
+    }));
+  }
   const site_id = uuid();
   const site_key = uuid();
   await createSite(db, {
@@ -3751,7 +3805,7 @@ app.post("/dashboard/sites", requireAuth, async (req, res) => {
     dry_run: req.body.dry_run === undefined ? true : Boolean(req.body.dry_run),
     log_full_payloads: req.body.log_full_payloads !== undefined,
     dataset_fk: dataset.id,
-    allowed_origins: DEFAULT_ALLOWED_ORIGINS || null
+    allowed_origins: allowedOrigins.length > 0 ? allowedOrigins.join(",") : null
   });
   await log({ type: "admin", message: "site created", site_id });
   res.redirect("/dashboard/sites");
