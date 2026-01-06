@@ -116,6 +116,7 @@ const CORS_ALLOWED_ORIGINS = (process.env.CORS_ALLOWED_ORIGINS || "https://mattm
   .split(",")
   .map(origin => origin.trim())
   .filter(Boolean);
+const DEFAULT_ALLOWED_ORIGINS = CORS_ALLOWED_ORIGINS.join(", ");
 
 const dbDir = path.dirname(DB_PATH);
 if (!fs.existsSync(dbDir)) {
@@ -123,6 +124,17 @@ if (!fs.existsSync(dbDir)) {
 }
 
 const db = await initDb(DB_PATH);
+
+const allowedOriginsMigrated = await getSetting(db, "allowed_origins_migrated");
+if (allowedOriginsMigrated !== "true") {
+  if (DEFAULT_ALLOWED_ORIGINS) {
+    await db.run(
+      "UPDATE sites SET allowed_origins = ? WHERE allowed_origins IS NULL OR TRIM(allowed_origins) = ''",
+      DEFAULT_ALLOWED_ORIGINS
+    );
+  }
+  await setSetting(db, "allowed_origins_migrated", "true");
+}
 
 await ensureSetting(db, "default_meta_api_version", "v24.0");
 await ensureSetting(db, "retry_count", "1");
@@ -266,8 +278,45 @@ app.use((req, res, next) => {
 
 app.use("/assets", express.static(path.join(process.cwd(), "public")));
 
+function normalizeOriginValue(value) {
+  if (!value) return null;
+  try {
+    const url = new URL(String(value).trim());
+    if (!["http:", "https:"].includes(url.protocol)) {
+      return null;
+    }
+    return url.origin;
+  } catch {
+    return null;
+  }
+}
+
+function parseAllowedOriginsInput(value) {
+  const raw = value ? String(value) : "";
+  const parts = raw.split(/[\n,]+/).map(part => part.trim()).filter(Boolean);
+  const origins = [];
+  const invalid = [];
+  parts.forEach(part => {
+    const cleaned = part.replace(/\/+$/, "");
+    const normalized = normalizeOriginValue(cleaned);
+    if (!normalized || normalized !== cleaned) {
+      invalid.push(part);
+      return;
+    }
+    if (!origins.includes(normalized)) {
+      origins.push(normalized);
+    }
+  });
+  return { origins, invalid };
+}
+
+function formatAllowedOriginsTextarea(value) {
+  const { origins } = parseAllowedOriginsInput(value);
+  return origins.join("\n");
+}
+
 const rateLimitState = new Map();
-const publicCors = cors({
+const legacyPublicCors = cors({
   origin: (origin, callback) => {
     if (!origin) return callback(null, false);
     if (CORS_ALLOWED_ORIGINS.includes(origin)) {
@@ -280,6 +329,46 @@ const publicCors = cors({
   credentials: false,
   optionsSuccessStatus: 204
 });
+
+const PUBLIC_CORS_METHODS = "GET,POST,OPTIONS";
+const PUBLIC_CORS_HEADERS = "Content-Type";
+
+function setPublicCorsHeaders(res, origin) {
+  res.set("Access-Control-Allow-Origin", origin);
+  res.set("Vary", "Origin");
+  res.set("Access-Control-Allow-Credentials", "false");
+  res.set("Access-Control-Allow-Methods", PUBLIC_CORS_METHODS);
+  res.set("Access-Control-Allow-Headers", PUBLIC_CORS_HEADERS);
+}
+
+async function publicCors(req, res, next) {
+  try {
+    const origin = req.get("origin");
+    if (!origin) {
+      return res.status(403).json({ error: "Origin header required for CORS." });
+    }
+    const siteKey =
+      req.query?.site_key ?? req.body?.site_key ?? req.headers["x-site-key"];
+    if (!siteKey) {
+      return res.status(403).json({ error: "site_key required for CORS validation." });
+    }
+    const site = await getSiteByKey(db, siteKey);
+    if (!site) {
+      return res.status(403).json({ error: "Unknown site_key for CORS validation." });
+    }
+    const { origins } = parseAllowedOriginsInput(site.allowed_origins);
+    if (!origins.includes(origin)) {
+      return res.status(403).json({ error: "Origin not allowed for this site." });
+    }
+    setPublicCorsHeaders(res, origin);
+    if (req.method === "OPTIONS") {
+      return res.status(204).send();
+    }
+    return next();
+  } catch (error) {
+    return next(error);
+  }
+}
 
 const TEST_EVENT_TYPES = ["PageView", "ViewContent", "Lead", "AddToCart", "Purchase"];
 const DEFAULT_TEST_EVENT_SOURCE_URL = "https://example.com/test";
@@ -2476,7 +2565,8 @@ app.post("/admin/sites", requireAuth, async (req, res) => {
     send_to_meta: Boolean(send_to_meta),
     dry_run: dry_run === undefined ? true : Boolean(dry_run),
     log_full_payloads: log_full_payloads !== false,
-    dataset_fk: dataset.id
+    dataset_fk: dataset.id,
+    allowed_origins: DEFAULT_ALLOWED_ORIGINS || null
   });
 
   await log({ type: "admin", message: "site created", site_id });
@@ -3246,6 +3336,7 @@ app.get("/dashboard/sites/:siteId", requireAuth, async (req, res) => {
   const testEventOptions = TEST_EVENT_TYPES.map(
     type => `<option value="${type}">${type}</option>`
   ).join("");
+  const allowedOriginsValue = escapeHtml(formatAllowedOriginsTextarea(site.allowed_origins));
 
   const body = `
     <div class="card">
@@ -3278,6 +3369,14 @@ app.get("/dashboard/sites/:siteId", requireAuth, async (req, res) => {
         </label>
         <label>Test Event Code
           <input name="test_event_code" value="${site.test_event_code ?? ""}" />
+        </label>
+        <label>Allowed origins
+          <textarea name="allowed_origins" rows="3" placeholder="https://example.com">${allowedOriginsValue}</textarea>
+          <span class="muted">Comma or newline separated list of allowed origins for SDK calls.</span>
+          <div class="inline">
+            <button type="button" class="secondary" id="copy-origin">Copy current origin</button>
+            <span class="muted" id="copy-origin-status"></span>
+          </div>
         </label>
         <label class="checkbox">
           <input type="checkbox" name="send_to_meta" ${site.send_to_meta ? "checked" : ""} />
@@ -3386,6 +3485,41 @@ app.get("/dashboard/sites/:siteId", requireAuth, async (req, res) => {
           alert('No access token stored yet.');
         }
       });
+    </script>
+    <script>
+      const copyOriginButton = document.getElementById('copy-origin');
+      const copyOriginStatus = document.getElementById('copy-origin-status');
+      const allowedOriginsInput = document.querySelector('textarea[name="allowed_origins"]');
+
+      function updateCopyOriginStatus(message) {
+        if (!copyOriginStatus) return;
+        copyOriginStatus.textContent = message;
+        if (message) {
+          setTimeout(() => {
+            if (copyOriginStatus.textContent === message) {
+              copyOriginStatus.textContent = '';
+            }
+          }, 2000);
+        }
+      }
+
+      if (copyOriginButton && allowedOriginsInput) {
+        copyOriginButton.addEventListener('click', async () => {
+          const origin = window.location.origin;
+          if (navigator.clipboard?.writeText) {
+            try {
+              await navigator.clipboard.writeText(origin);
+              updateCopyOriginStatus('Copied!');
+              return;
+            } catch {
+              // fall through to append
+            }
+          }
+          const trimmed = allowedOriginsInput.value.trim();
+          allowedOriginsInput.value = trimmed ? trimmed + '\\n' + origin : origin;
+          updateCopyOriginStatus('Added to list');
+        });
+      }
     </script>
     <script>
       const testForm = document.getElementById('test-event-form');
@@ -3616,7 +3750,8 @@ app.post("/dashboard/sites", requireAuth, async (req, res) => {
     send_to_meta: Boolean(req.body.send_to_meta),
     dry_run: req.body.dry_run === undefined ? true : Boolean(req.body.dry_run),
     log_full_payloads: req.body.log_full_payloads !== undefined,
-    dataset_fk: dataset.id
+    dataset_fk: dataset.id,
+    allowed_origins: DEFAULT_ALLOWED_ORIGINS || null
   });
   await log({ type: "admin", message: "site created", site_id });
   res.redirect("/dashboard/sites");
@@ -3639,6 +3774,23 @@ app.post("/dashboard/sites/:siteId", requireAuth, async (req, res) => {
       body: `<div class="card"><h1>Invalid dataset</h1><p class="muted">Select a valid dataset.</p></div>`
     }));
   }
+  const { origins: allowedOrigins, invalid: invalidOrigins } = parseAllowedOriginsInput(
+    req.body.allowed_origins
+  );
+  if (invalidOrigins.length > 0) {
+    const invalidList = invalidOrigins.map(origin => escapeHtml(origin)).join(", ");
+    return res.status(400).send(renderPage({
+      title: "Invalid allowed origins",
+      body: `
+        <div class="card">
+          <h1>Invalid allowed origins</h1>
+          <p class="muted">Each entry must be a full origin like <code>https://example.com</code>.</p>
+          <p>Invalid entries: ${invalidList}</p>
+          <p><a href="/dashboard/sites/${site_id}">Return to site settings</a></p>
+        </div>
+      `
+    }));
+  }
   await updateSite(db, {
     site_id,
     name: req.body.name,
@@ -3648,7 +3800,8 @@ app.post("/dashboard/sites/:siteId", requireAuth, async (req, res) => {
     send_to_meta: Boolean(req.body.send_to_meta),
     dry_run: Boolean(req.body.dry_run),
     log_full_payloads: req.body.log_full_payloads !== undefined,
-    dataset_fk: dataset.id
+    dataset_fk: dataset.id,
+    allowed_origins: allowedOrigins.join(",")
   });
   await log({ type: "admin", message: "site updated", site_id });
   res.redirect(`/dashboard/sites/${site_id}`);
@@ -4790,7 +4943,7 @@ app.post("/v/track", publicCors, async (req, res) => {
     video_id: req.body?.video_id ?? null,
     percent: req.body?.percent ?? null
   });
-  const siteKey = req.headers["x-site-key"] || req.body?.site_key;
+  const siteKey = req.headers["x-site-key"] || req.body?.site_key || req.query?.site_key;
   const site = siteKey ? await getSiteByKey(db, siteKey) : null;
 
   if (!site) {
@@ -5135,8 +5288,8 @@ app.post("/v/track", publicCors, async (req, res) => {
   });
 });
 
-app.options("/collect", publicCors);
-app.post("/collect", publicCors, async (req, res) => {
+app.options("/collect", legacyPublicCors);
+app.post("/collect", legacyPublicCors, async (req, res) => {
   const siteKey = req.headers["x-site-key"];
   const site = siteKey ? await getSiteByKey(db, siteKey) : null;
 

@@ -20,6 +20,7 @@ export async function initDb(dbPath) {
       send_to_meta INTEGER DEFAULT 0,
       dry_run INTEGER DEFAULT 1,
       log_full_payloads INTEGER DEFAULT 1,
+      allowed_origins TEXT,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
@@ -134,6 +135,7 @@ export async function initDb(dbPath) {
   await addColumn("events", "event_time_client INTEGER");
   await addColumn("events", "test_event_code TEXT");
   await addColumn("sites", "dataset_fk INTEGER");
+  await addColumn("sites", "allowed_origins TEXT");
   await addColumn("outbound_logs", "dataset_fk INTEGER");
   await addColumn("outbound_logs", "dataset_id TEXT");
 
@@ -364,7 +366,7 @@ export async function updateUserPassword(db, userId, passwordHash) {
 
 export async function createSite(db, site) {
   await db.run(
-    "INSERT INTO sites (site_id, site_key, name, pixel_id, access_token, test_event_code, send_to_meta, dry_run, log_full_payloads, dataset_fk, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+    "INSERT INTO sites (site_id, site_key, name, pixel_id, access_token, test_event_code, send_to_meta, dry_run, log_full_payloads, dataset_fk, allowed_origins, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
     site.site_id,
     site.site_key,
     site.name,
@@ -374,13 +376,14 @@ export async function createSite(db, site) {
     site.send_to_meta ? 1 : 0,
     site.dry_run ? 1 : 0,
     site.log_full_payloads ? 1 : 0,
-    site.dataset_fk ?? null
+    site.dataset_fk ?? null,
+    site.allowed_origins ?? null
   );
 }
 
 export async function updateSite(db, site) {
   await db.run(
-    "UPDATE sites SET name = ?, pixel_id = ?, access_token = ?, test_event_code = ?, send_to_meta = ?, dry_run = ?, log_full_payloads = ?, dataset_fk = ?, updated_at = CURRENT_TIMESTAMP WHERE site_id = ?",
+    "UPDATE sites SET name = ?, pixel_id = ?, access_token = ?, test_event_code = ?, send_to_meta = ?, dry_run = ?, log_full_payloads = ?, dataset_fk = ?, allowed_origins = ?, updated_at = CURRENT_TIMESTAMP WHERE site_id = ?",
     site.name,
     site.pixel_id,
     site.access_token,
@@ -389,6 +392,7 @@ export async function updateSite(db, site) {
     site.dry_run ? 1 : 0,
     site.log_full_payloads ? 1 : 0,
     site.dataset_fk ?? null,
+    site.allowed_origins ?? null,
     site.site_id
   );
 }
