@@ -613,6 +613,43 @@ function resolveOutboundStatus(result) {
   return result;
 }
 
+function resolveReceivedAtRange(query = {}) {
+  const from = Number.parseInt(query.from ?? "", 10);
+  const to = Number.parseInt(query.to ?? "", 10);
+  if (!Number.isNaN(from) && !Number.isNaN(to)) {
+    return { startUtcMs: from, endUtcMs: to };
+  }
+  const range = String(query.range ?? "").toLowerCase();
+  const now = Date.now();
+  if (range === "24h") {
+    return { startUtcMs: now - 24 * 60 * 60 * 1000, endUtcMs: now };
+  }
+  if (range === "7d") {
+    return { startUtcMs: now - 7 * 24 * 60 * 60 * 1000, endUtcMs: now };
+  }
+  if (range === "today") {
+    const timeZone = normalizeTimeZone(query.time_zone) || cachedTimeZone || DEFAULT_TIME_ZONE;
+    const startUtcMs = getStartOfDayUtcMs(timeZone, new Date());
+    const endUtcMs = getNextStartOfDayUtcMs(timeZone, startUtcMs) - 1;
+    return { startUtcMs, endUtcMs };
+  }
+  return null;
+}
+
+function resolveEventFilters(query = {}) {
+  return {
+    siteId: query.site_id || query.site || undefined,
+    pixelId: query.pixel_id || query.pixel || undefined,
+    datasetId: query.dataset_id || query.dataset || undefined,
+    status: query.status || undefined,
+    eventName: query.event_name || undefined,
+    videoId: query.video_id || undefined,
+    eventType: query.event_type || undefined,
+    receivedAtRange: resolveReceivedAtRange(query),
+    videoMode: query.mode || undefined
+  };
+}
+
 function maskToken(token) {
   if (!token) return "—";
   const trimmed = token.trim();
@@ -2159,7 +2196,7 @@ app.get("/admin/datasets/:datasetId", requireAuth, async (req, res) => {
   const outboundEvents = (await listEvents(db, { limit: 50, datasetId: dataset.id }))
     .filter(event => event.outbound_result)
     .slice(0, 25);
-  const errors = await listRecentErrors(db, 25, dataset.id);
+  const errors = await listRecentErrors(db, 25, { datasetId: dataset.id });
   const summaryInbound24h = await db.get(
     `
       SELECT COUNT(*) as count
@@ -2635,19 +2672,42 @@ app.post("/admin/sites", requireAuth, async (req, res) => {
 app.get("/admin/logs", requireAuth, async (req, res) => {
   const limit = Number.parseInt(req.query.limit ?? "20", 10);
   const safeLimit = Number.isNaN(limit) ? 20 : limit;
-  const todayFilter =
-    req.query.today === "1" || req.query.today === "true" || req.query.today === "yes";
-  let receivedAtRange = null;
-  if (todayFilter) {
-    const timeZone =
-      normalizeTimeZone(req.query.time_zone) || cachedTimeZone || DEFAULT_TIME_ZONE;
-    const startUtcMs = getStartOfDayUtcMs(timeZone, new Date());
-    const endUtcMs = getNextStartOfDayUtcMs(timeZone, startUtcMs) - 1;
-    receivedAtRange = { startUtcMs, endUtcMs };
-  }
-  const events = await listEvents(db, { limit: safeLimit, receivedAtRange });
-  const errors = await listRecentErrors(db, safeLimit);
+  const filters = resolveEventFilters(req.query);
+  const events = await listEvents(db, {
+    limit: safeLimit,
+    ...filters
+  });
+  const errors = await listRecentErrors(db, safeLimit, {
+    datasetId: filters.datasetId,
+    siteId: filters.siteId,
+    pixelId: filters.pixelId
+  });
   res.json({ events, errors });
+});
+
+app.get("/api/events", requireAuth, async (req, res) => {
+  const limit = Number.parseInt(req.query.limit ?? "50", 10);
+  const safeLimit = Number.isNaN(limit) ? 50 : Math.min(Math.max(limit, 1), 200);
+  const filters = resolveEventFilters(req.query);
+  const events = await listEvents(db, { limit: safeLimit, ...filters });
+  res.json({ ok: true, rows: events.map(event => maskEventForDisplay(event)) });
+});
+
+app.get("/api/logs", requireAuth, async (req, res) => {
+  const limit = Number.parseInt(req.query.limit ?? "20", 10);
+  const safeLimit = Number.isNaN(limit) ? 20 : Math.min(Math.max(limit, 1), 200);
+  const filters = resolveEventFilters(req.query);
+  const events = await listEvents(db, { limit: safeLimit, ...filters });
+  const errors = await listRecentErrors(db, safeLimit, {
+    datasetId: filters.datasetId,
+    siteId: filters.siteId,
+    pixelId: filters.pixelId
+  });
+  res.json({
+    ok: true,
+    events: events.map(event => maskEventForDisplay(event)),
+    errors
+  });
 });
 
 app.get("/api/errors/recent", requireAuth, async (req, res) => {
@@ -2657,7 +2717,7 @@ app.get("/api/errors/recent", requireAuth, async (req, res) => {
   const datasetId = req.query.dataset_id ?? null;
   const rows = type
     ? await listErrors(db, { type, limit: safeLimit, datasetId })
-    : await listRecentErrors(db, safeLimit, datasetId);
+    : await listRecentErrors(db, safeLimit, { datasetId });
   res.json({ ok: true, rows });
 });
 
@@ -2938,7 +2998,7 @@ app.get("/dashboard", requireAuth, async (req, res) => {
   const deduped24h = await countDedupedSince(db, 24, datasetId);
   const dedupRate = events24h ? Math.round((deduped24h / events24h) * 100) : 0;
   const recentEvents = await listEvents(db, { limit: 10, datasetId });
-  const recentErrors = await listRecentErrors(db, 10, datasetId);
+  const recentErrors = await listRecentErrors(db, 10, { datasetId });
   const sites = await getSites(db);
   const skippedCount = datasetId
     ? await db.get(
@@ -3208,8 +3268,8 @@ app.get("/dashboard", requireAuth, async (req, res) => {
         tr.appendChild(createCell(row.percent));
         tr.appendChild(createCell(row.watched_seconds));
         tr.appendChild(createCell(row.duration));
-        tr.appendChild(createCell(row.trace_id));
-        tr.appendChild(createCell(row.origin));
+        tr.appendChild(createCell(row.trace_id, 'mono wrap-anywhere'));
+        tr.appendChild(createCell(row.origin, 'wrap-anywhere'));
         tr.appendChild(createCell(row.ip));
         const uaCell = createCell(row.user_agent);
         uaCell.classList.add('truncate');
@@ -4466,71 +4526,131 @@ app.get("/dashboard/live", requireAuth, async (req, res) => {
     </div>
     ${logFiltersBanner}
     <div class="split-pane">
-      <section class="pane pane-list">
-        <div class="filters">
-          <label>Dataset
-            <select id="filter-dataset">
-              ${datasetOptions}
-            </select>
-          </label>
-          <label>Site
-            <select id="filter-site">
-              <option value="">All sites</option>
-              ${siteOptions}
-            </select>
-          </label>
-          <label>Event type
-            <select id="filter-type">
-              <option value="">All</option>
-              <option value="video_milestone">Video milestone</option>
-            </select>
-          </label>
-          <label>Video ID
-            <input id="filter-video" placeholder="video-123" />
-          </label>
-          <label>Status
-            <select id="filter-status">
-              <option value="">All</option>
-              <option value="outbound_sent">Outbound sent</option>
-              <option value="outbound_skipped">Outbound skipped</option>
-              <option value="outbound_failed">Outbound failed</option>
-              <option value="duplicate">Duplicate</option>
-              <option value="deduped">Deduped</option>
-            </select>
-          </label>
-          <label>Event name
-            <input id="filter-name" placeholder="Purchase" />
-          </label>
+      <section class="pane pane-list card">
+        <div class="control-grid">
+          <div class="control-row">
+            <label>Site
+              <select id="filter-site">
+                <option value="">All sites</option>
+                ${siteOptions}
+              </select>
+            </label>
+            <label>Dataset
+              <select id="filter-dataset">
+                ${datasetOptions}
+              </select>
+            </label>
+            <label>Date range
+              <select id="filter-range">
+                <option value="24h">Last 24 hours</option>
+                <option value="7d">Last 7 days</option>
+                <option value="today">Today</option>
+                <option value="all">All time</option>
+              </select>
+            </label>
+          </div>
+          <div class="control-row">
+            <label>Event type
+              <select id="filter-type">
+                <option value="">All</option>
+                <option value="video_milestone">Video milestone</option>
+              </select>
+            </label>
+            <label>Mode
+              <select id="filter-mode">
+                <option value="">All</option>
+                <option value="test">Test</option>
+                <option value="live">Live</option>
+              </select>
+            </label>
+            <label>Status
+              <select id="filter-status">
+                <option value="">All</option>
+                <option value="outbound_sent">Outbound sent</option>
+                <option value="outbound_skipped">Outbound skipped</option>
+                <option value="outbound_failed">Outbound failed</option>
+                <option value="duplicate">Duplicate</option>
+                <option value="deduped">Deduped</option>
+              </select>
+            </label>
+            <label>Search
+              <input id="filter-name" placeholder="Purchase" />
+            </label>
+            <label>Video ID
+              <input id="filter-video" placeholder="video-123" />
+            </label>
+            <div class="control-actions">
+              <button type="button" id="refresh-dashboard" class="secondary">Refresh</button>
+            </div>
+          </div>
         </div>
         <div id="event-stream" class="event-stream"></div>
       </section>
-      <section class="pane pane-detail">
-        <div class="card" id="event-detail">
-          <h2>Event detail</h2>
-          <p class="muted">Select an event to inspect payloads.</p>
-        </div>
+      <section class="pane pane-detail card" id="event-detail">
+        <h2>Event detail</h2>
+        <p class="muted">Select an event to inspect payloads.</p>
       </section>
+    </div>
+    <div class="card">
+      <div class="inline">
+        <div>
+          <h2>Recent logs</h2>
+          <p class="muted">Latest errors for the active filters.</p>
+        </div>
+        <div class="muted" id="log-count">0 logs</div>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Type</th>
+            <th>Message</th>
+            <th>Site</th>
+            <th>Dataset</th>
+          </tr>
+        </thead>
+        <tbody id="log-body"></tbody>
+      </table>
     </div>
     <script>
       const timeZone = ${JSON.stringify(cachedTimeZone)};
+      const initialDatasetId = ${JSON.stringify(selectedDatasetId)};
       const streamEl = document.getElementById('event-stream');
       const detailEl = document.getElementById('event-detail');
+      const logBody = document.getElementById('log-body');
+      const logCount = document.getElementById('log-count');
       const filterDataset = document.getElementById('filter-dataset');
       const filterSite = document.getElementById('filter-site');
+      const filterRange = document.getElementById('filter-range');
       const filterType = document.getElementById('filter-type');
+      const filterMode = document.getElementById('filter-mode');
       const filterVideo = document.getElementById('filter-video');
       const filterStatus = document.getElementById('filter-status');
       const filterName = document.getElementById('filter-name');
+      const refreshButton = document.getElementById('refresh-dashboard');
 
-      function buildQuery() {
-        const params = new URLSearchParams();
-        if (filterDataset.value) params.set('dataset', filterDataset.value);
-        if (filterSite.value) params.set('site', filterSite.value);
-        if (filterType.value) params.set('event_type', filterType.value);
-        if (filterVideo.value) params.set('video_id', filterVideo.value);
-        if (filterStatus.value) params.set('status', filterStatus.value);
-        if (filterName.value) params.set('event_name', filterName.value);
-        return params.toString();
+      const defaultState = {
+        selectedSiteId: '',
+        selectedPixelId: '',
+        selectedRange: '24h',
+        selectedMode: '',
+        eventType: '',
+        status: '',
+        videoId: '',
+        search: ''
+      };
+
+      const state = { ...defaultState };
+      let activeController = null;
+      let typingTimeout = null;
+
+      function setLoading(isLoading) {
+        [filterDataset, filterSite, filterRange, filterType, filterMode, filterVideo, filterStatus, filterName, refreshButton]
+          .filter(Boolean)
+          .forEach(control => {
+            control.disabled = isLoading;
+          });
+        streamEl.classList.toggle('loading', isLoading);
       }
 
       function formatEventTime(value) {
@@ -4609,11 +4729,172 @@ app.get("/dashboard/live", requireAuth, async (req, res) => {
         return row;
       }
 
-      async function loadStream() {
-        const response = await fetch('/admin/events?limit=50&' + buildQuery());
-        const events = await response.json();
-        streamEl.innerHTML = '';
-        events.forEach(event => streamEl.appendChild(renderRow(event)));
+      function createCell(text, className) {
+        const cell = document.createElement('td');
+        if (className) cell.className = className;
+        cell.textContent = text === null || text === undefined || text === '' ? '—' : String(text);
+        return cell;
+      }
+
+      function renderLogRow(error) {
+        const tr = document.createElement('tr');
+        tr.appendChild(createCell(formatEventDate(error.created_at)));
+        tr.appendChild(createCell(error.type));
+        tr.appendChild(createCell(error.message, 'mono wrap-anywhere'));
+        tr.appendChild(createCell(error.site_name));
+        tr.appendChild(createCell(error.dataset_name ? error.dataset_name + ' (' + error.dataset_id + ')' : '—'));
+        return tr;
+      }
+
+      function resolveRangeParams(rangeValue) {
+        const now = Date.now();
+        if (rangeValue === 'today') {
+          return { type: 'named', value: 'today' };
+        }
+        if (rangeValue === '7d') {
+          return { type: 'absolute', from: now - 7 * 24 * 60 * 60 * 1000, to: now };
+        }
+        if (rangeValue === '24h') {
+          return { type: 'absolute', from: now - 24 * 60 * 60 * 1000, to: now };
+        }
+        return null;
+      }
+
+      function buildQueryFromState(currentState, { limit = '50' } = {}) {
+        const params = new URLSearchParams({ limit });
+        if (currentState.selectedSiteId) params.set('site_id', currentState.selectedSiteId);
+        if (currentState.selectedPixelId) params.set('pixel_id', currentState.selectedPixelId);
+        if (currentState.eventType) params.set('event_type', currentState.eventType);
+        if (currentState.videoId) params.set('video_id', currentState.videoId);
+        if (currentState.status) params.set('status', currentState.status);
+        if (currentState.search) params.set('event_name', currentState.search);
+        if (currentState.selectedMode) params.set('mode', currentState.selectedMode);
+        const rangeParams = resolveRangeParams(currentState.selectedRange);
+        if (rangeParams?.type === 'absolute') {
+          params.set('from', rangeParams.from);
+          params.set('to', rangeParams.to);
+        } else if (rangeParams?.type === 'named') {
+          params.set('range', rangeParams.value);
+        }
+        return params;
+      }
+
+      function updateUrlFromState() {
+        const params = new URLSearchParams();
+        if (state.selectedSiteId) params.set('site', state.selectedSiteId);
+        if (state.selectedPixelId) params.set('pixel', state.selectedPixelId);
+        if (state.selectedRange && state.selectedRange !== defaultState.selectedRange) {
+          params.set('range', state.selectedRange);
+        }
+        if (state.eventType) params.set('event_type', state.eventType);
+        if (state.selectedMode) params.set('mode', state.selectedMode);
+        if (state.status) params.set('status', state.status);
+        if (state.videoId) params.set('video_id', state.videoId);
+        if (state.search) params.set('event_name', state.search);
+        const query = params.toString();
+        const nextUrl = query ? window.location.pathname + '?' + query : window.location.pathname;
+        window.history.replaceState(null, '', nextUrl);
+      }
+
+      function applyState(nextState, { syncUrl = true } = {}) {
+        Object.assign(state, nextState);
+        if (filterSite) filterSite.value = state.selectedSiteId;
+        if (filterDataset) filterDataset.value = state.selectedPixelId;
+        if (filterRange) filterRange.value = state.selectedRange;
+        if (filterType) filterType.value = state.eventType;
+        if (filterMode) filterMode.value = state.selectedMode;
+        if (filterStatus) filterStatus.value = state.status;
+        if (filterVideo) filterVideo.value = state.videoId;
+        if (filterName) filterName.value = state.search;
+        if (syncUrl) updateUrlFromState();
+      }
+
+      function readStateFromControls() {
+        return {
+          selectedSiteId: filterSite.value,
+          selectedPixelId: filterDataset.value,
+          selectedRange: filterRange.value,
+          eventType: filterType.value,
+          selectedMode: filterMode.value,
+          status: filterStatus.value,
+          videoId: filterVideo.value.trim(),
+          search: filterName.value.trim()
+        };
+      }
+
+      function readStateFromUrl() {
+        const params = new URLSearchParams(window.location.search);
+        return {
+          selectedSiteId: params.get('site') || '',
+          selectedPixelId: params.get('pixel') || params.get('dataset') || '',
+          selectedRange: params.get('range') || defaultState.selectedRange,
+          eventType: params.get('event_type') || '',
+          selectedMode: params.get('mode') || '',
+          status: params.get('status') || '',
+          videoId: params.get('video_id') || '',
+          search: params.get('event_name') || ''
+        };
+      }
+
+      async function loadDashboard(currentState) {
+        if (activeController) {
+          activeController.abort();
+        }
+        const controller = new AbortController();
+        activeController = controller;
+        setLoading(true);
+        streamEl.innerHTML = '<p class="muted">Loading events…</p>';
+        logBody.innerHTML = '<tr><td colspan="5" class="muted">Loading logs…</td></tr>';
+        const eventParams = buildQueryFromState(currentState, { limit: '50' });
+        const logParams = buildQueryFromState(currentState, { limit: '20' });
+
+        try {
+          const [eventsResponse, logsResponse] = await Promise.all([
+            fetch('/api/events?' + eventParams.toString(), { signal: controller.signal }),
+            fetch('/api/logs?' + logParams.toString(), { signal: controller.signal })
+          ]);
+          if (controller.signal.aborted) return null;
+          const eventsPayload = await eventsResponse.json();
+          const logsPayload = await logsResponse.json();
+          if (controller.signal.aborted) return null;
+
+          streamEl.innerHTML = '';
+          const events = eventsPayload?.rows || [];
+          if (events.length) {
+            events.forEach(event => streamEl.appendChild(renderRow(event)));
+          } else {
+            streamEl.innerHTML = '<p class="muted">No events found.</p>';
+          }
+
+          const errors = logsPayload?.errors || [];
+          logBody.innerHTML = '';
+          if (errors.length) {
+            logBody.replaceChildren(...errors.map(renderLogRow));
+          } else {
+            logBody.innerHTML = '<tr><td colspan="5" class="muted">No logs yet.</td></tr>';
+          }
+          logCount.textContent = errors.length + ' logs';
+
+          setLoading(false);
+
+          return {
+            site: state.selectedSiteId ? { id: state.selectedSiteId } : null,
+            pixels: Array.from(filterDataset.options || []).map(option => ({
+              id: option.value,
+              label: option.textContent
+            })),
+            events,
+            logs: errors,
+            stats: { eventCount: events.length, logCount: errors.length }
+          };
+        } catch (error) {
+          if (error.name === 'AbortError') return null;
+          streamEl.innerHTML = '<p class="muted">Unable to load events.</p>';
+          logBody.innerHTML = '<tr><td colspan="5" class="muted">Unable to load logs.</td></tr>';
+          logCount.textContent = '—';
+          setLoading(false);
+          return null;
+        }
       }
 
       function renderJsonBlock(title, content) {
@@ -4696,25 +4977,45 @@ app.get("/dashboard/live", requireAuth, async (req, res) => {
         });
       }
 
-      [filterDataset, filterSite, filterType, filterStatus].forEach(el => el.addEventListener('change', loadStream));
-      filterVideo.addEventListener('input', () => {
-        if (filterVideo.value.length === 0 || filterVideo.value.length > 2) {
-          loadStream();
+      function updateStateAndReload({ immediate = true } = {}) {
+        applyState(readStateFromControls());
+        if (typingTimeout) clearTimeout(typingTimeout);
+        if (immediate) {
+          loadDashboard(state);
+        } else {
+          typingTimeout = setTimeout(() => loadDashboard(state), 300);
         }
-      });
-      filterName.addEventListener('input', () => {
-        if (filterName.value.length === 0 || filterName.value.length > 2) {
-          loadStream();
+      }
+
+      [filterDataset, filterSite, filterRange, filterType, filterMode, filterStatus].forEach(el => {
+        if (el) {
+          el.addEventListener('change', () => updateStateAndReload());
         }
       });
 
-      const urlParams = new URLSearchParams(window.location.search);
-      if (urlParams.get('site')) filterSite.value = urlParams.get('site');
-      if (urlParams.get('event_type')) filterType.value = urlParams.get('event_type');
-      if (urlParams.get('video_id')) filterVideo.value = urlParams.get('video_id');
+      [filterVideo, filterName].forEach(input => {
+        if (!input) return;
+        input.addEventListener('input', () => {
+          const value = input.value.trim();
+          if (value.length === 0 || value.length > 2) {
+            updateStateAndReload({ immediate: false });
+          }
+        });
+      });
 
-      loadStream();
-      setInterval(loadStream, 2000);
+      if (refreshButton) {
+        refreshButton.addEventListener('click', () => loadDashboard(state));
+      }
+
+      const initialState = {
+        ...defaultState,
+        selectedPixelId: initialDatasetId || '',
+        ...readStateFromUrl()
+      };
+      applyState(initialState, { syncUrl: false });
+
+      loadDashboard(state);
+      setInterval(() => loadDashboard(state), 2000);
     </script>
   `;
   res.send(renderPage({ title: "Live Events", body }));
@@ -4766,7 +5067,7 @@ app.get("/dashboard/errors", requireAuth, async (req, res) => {
   const limit = 50;
   const errors = selectedType
     ? await listErrors(db, { type: selectedType, limit, datasetId })
-    : await listRecentErrors(db, limit, datasetId);
+    : await listRecentErrors(db, limit, { datasetId });
 
   const typeOptions = [
     `<option value="" ${selectedType ? "" : "selected"}>All types</option>`,
@@ -4957,14 +5258,10 @@ app.post("/admin/settings/password", requireAuth, async (req, res) => {
 
 app.get("/admin/events", requireAuth, async (req, res) => {
   const limit = Number.parseInt(req.query.limit ?? "50", 10);
+  const filters = resolveEventFilters(req.query);
   const events = await listEvents(db, {
     limit: Number.isNaN(limit) ? 50 : limit,
-    siteId: req.query.site || undefined,
-    datasetId: req.query.dataset || undefined,
-    status: req.query.status || undefined,
-    eventName: req.query.event_name || undefined,
-    videoId: req.query.video_id || undefined,
-    eventType: req.query.event_type || undefined
+    ...filters
   });
   res.json(events.map(event => maskEventForDisplay(event)));
 });
