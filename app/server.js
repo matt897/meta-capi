@@ -1582,19 +1582,50 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
       }
 
       function getPersistedMilestones(storageKey) {
+        let sessionMilestones = [];
+        let localMilestones = [];
+        let migratedFromLocalStorage = false;
+        try {
+          const raw = sessionStorage.getItem(storageKey);
+          if (raw) {
+            const parsed = JSON.parse(raw);
+            sessionMilestones = Array.isArray(parsed) ? parsed : [];
+          }
+        } catch (err) {
+          sessionMilestones = [];
+        }
         try {
           const raw = localStorage.getItem(storageKey);
-          if (!raw) return [];
-          const parsed = JSON.parse(raw);
-          return Array.isArray(parsed) ? parsed : [];
+          if (raw) {
+            const parsed = JSON.parse(raw);
+            localMilestones = Array.isArray(parsed) ? parsed : [];
+            migratedFromLocalStorage = true;
+          }
         } catch (err) {
-          return [];
+          localMilestones = [];
         }
+
+        const merged = Array.from(new Set([...sessionMilestones, ...localMilestones]));
+
+        if (migratedFromLocalStorage) {
+          try {
+            sessionStorage.setItem(storageKey, JSON.stringify(merged));
+          } catch (err) {
+            // ignore storage errors
+          }
+          try {
+            localStorage.removeItem(storageKey);
+          } catch (err) {
+            // ignore storage errors
+          }
+        }
+
+        return { milestones: merged, migratedFromLocalStorage };
       }
 
       function persistMilestones(storageKey, milestones) {
         try {
-          localStorage.setItem(storageKey, JSON.stringify(milestones));
+          sessionStorage.setItem(storageKey, JSON.stringify(milestones));
         } catch (err) {
           // ignore storage errors
         }
@@ -1774,17 +1805,21 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
           const firedStorageKey = 'metaCapiVideoMilestones:' + siteKey + ':' + videoId;
           const legacyStorageKey = 'metaCapiVideoMilestones:' + videoId;
           const fired = new Set();
-          const legacyMilestones = getPersistedMilestones(legacyStorageKey);
-          const storedMilestones = getPersistedMilestones(firedStorageKey);
-          [...legacyMilestones, ...storedMilestones].forEach(milestone => fired.add(milestone));
-          if (legacyMilestones.length) {
+          const legacyMilestoneState = getPersistedMilestones(legacyStorageKey);
+          const storedMilestoneState = getPersistedMilestones(firedStorageKey);
+          const migratedFromLocalStorage =
+            legacyMilestoneState.migratedFromLocalStorage || storedMilestoneState.migratedFromLocalStorage;
+          [...legacyMilestoneState.milestones, ...storedMilestoneState.milestones].forEach(milestone =>
+            fired.add(milestone)
+          );
+          if (legacyMilestoneState.milestones.length) {
             persistMilestones(firedStorageKey, Array.from(fired.values()));
             try {
-              localStorage.removeItem(legacyStorageKey);
+              sessionStorage.removeItem(legacyStorageKey);
               log('migrated legacy milestones', {
                 legacyStorageKey,
                 storageKey: firedStorageKey,
-                migrated: legacyMilestones
+                migrated: legacyMilestoneState.milestones
               });
             } catch (migrateErr) {
               warn('failed to clear legacy milestones', migrateErr);
@@ -1798,12 +1833,21 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
 
           if (RESET_QUERY_VALUE === '1') {
             try {
-              localStorage.removeItem(firedStorageKey);
+              sessionStorage.removeItem(firedStorageKey);
               fired.clear();
               log('reset milestones via capi_reset=1', { storageKey: firedStorageKey });
             } catch (resetErr) {
               warn('failed to reset milestones', resetErr);
             }
+          }
+
+          if (debug) {
+            console.log('[CAPI VT] storage_init', {
+              storageBackend: 'sessionStorage',
+              storageKey: firedStorageKey,
+              migratedFromLocalStorage,
+              initialFired: Array.from(fired.values())
+            });
           }
 
           function updateFiredStorage() {
