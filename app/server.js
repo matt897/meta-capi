@@ -1705,9 +1705,10 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
         });
 
         const apiBaseCandidate = script.dataset.apiBase || window.CAPI_VT_API_BASE;
-        const baseUrl = apiBaseCandidate
-          ? String(apiBaseCandidate).replace(/\/+$/, '')
-          : new URL(script.src, window.location.href).origin;
+        let baseUrl = new URL(script.src, window.location.href).origin;
+        if (apiBaseCandidate) {
+          baseUrl = String(apiBaseCandidate).replace(/\/+$/, '');
+        }
         const trackUrl = baseUrl + '/v/track';
         if (debug) {
           console.log('[CAPI VT] api_base', { apiBase: baseUrl, trackUrl });
