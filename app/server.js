@@ -1,7 +1,6 @@
 import crypto from "crypto";
 import express from "express";
 import helmet from "helmet";
-import cors from "cors";
 import session from "express-session";
 import SQLiteStoreFactory from "connect-sqlite3";
 import { v4 as uuid } from "uuid";
@@ -85,14 +84,26 @@ app.use(
 );
 app.use(express.urlencoded({ extended: true }));
 const REQUEST_LOG_PATHS = new Set(["/sdk/config", "/sdk/ping", "/v/track"]);
+const DEBUG_CAPI = ["1", "true", "yes"].includes(String(process.env.DEBUG_CAPI || "").toLowerCase());
+
+function debugLog(...args) {
+  if (DEBUG_CAPI) {
+    console.log(...args);
+  }
+}
+
 app.use((req, res, next) => {
+  if (!DEBUG_CAPI) {
+    next();
+    return;
+  }
   if (!REQUEST_LOG_PATHS.has(req.path)) {
     next();
     return;
   }
   res.on("finish", () => {
     const body = req.body && typeof req.body === "object" ? req.body : {};
-    console.log("[REQ]", req.method, req.path, res.statusCode, {
+    debugLog("[REQ]", req.method, req.path, res.statusCode, {
       origin: req.get("origin") || null,
       referer: req.get("referer") || null,
       userAgent: req.get("user-agent") || null,
@@ -318,22 +329,8 @@ function formatAllowedOriginsTextarea(value) {
 }
 
 const rateLimitState = new Map();
-const legacyPublicCors = cors({
-  origin: (origin, callback) => {
-    if (!origin) return callback(null, false);
-    if (CORS_ALLOWED_ORIGINS.includes(origin)) {
-      return callback(null, origin);
-    }
-    return callback(null, false);
-  },
-  methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "X-Site-Key", "X-Meta-Test-Event-Code"],
-  credentials: false,
-  optionsSuccessStatus: 204
-});
-
 const PUBLIC_CORS_METHODS = "GET, POST, OPTIONS";
-const PUBLIC_CORS_HEADERS = "Content-Type, X-Site-Key";
+const PUBLIC_CORS_HEADERS = "Content-Type, X-Site-Key, X-Meta-Test-Event-Code";
 const PUBLIC_CORS_MAX_AGE = "86400";
 
 function setPublicCorsHeaders(res) {
@@ -1510,7 +1507,7 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
   res.send(`
     (function() {
       window.__CAPI_VT_EXEC__ = (window.__CAPI_VT_EXEC__ || 0) + 1;
-      const SDK_VERSION = "0.1.0";
+      const SDK_VERSION = "0.1.1";
       const DEBUG_QUERY_VALUE = new URLSearchParams(window.location.search).get('capi_debug');
       const RESET_QUERY_VALUE = new URLSearchParams(window.location.search).get('capi_reset');
       const SCRIPT = document.currentScript;
@@ -1707,7 +1704,7 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
         const apiBaseCandidate = script.dataset.apiBase || window.CAPI_VT_API_BASE;
         let baseUrl = new URL(script.src, window.location.href).origin;
         if (apiBaseCandidate) {
-          baseUrl = String(apiBaseCandidate).replace(/\/+$/, '');
+          baseUrl = String(apiBaseCandidate).trim().replace(/\/+$/, '');
         }
         const trackUrl = baseUrl + '/v/track';
         if (debug) {
@@ -5340,7 +5337,7 @@ app.get("/debug/pipeline", async (req, res) => {
 
 app.options("/v/track", publicCors);
 app.post("/v/track", publicCors, async (req, res) => {
-  console.log("[TRACK HIT]", {
+  debugLog("[TRACK HIT]", {
     hasSiteKey: Boolean(req.headers["x-site-key"] || req.body?.site_key),
     bodyKeys: Object.keys(req.body || {}),
     video_id: req.body?.video_id ?? null,
@@ -5396,7 +5393,7 @@ app.post("/v/track", publicCors, async (req, res) => {
     userData.fbc = deriveFbcFromFbclid(fbclid);
   }
 
-  console.log("[TRACK SOURCES]", {
+  debugLog("[TRACK SOURCES]", {
     event_source_url_source: sourceUrlResolution.source,
     client_user_agent_source: userDataSources.client_user_agent,
     client_ip_address_source: userDataSources.client_ip_address
@@ -5699,8 +5696,8 @@ app.post("/v/track", publicCors, async (req, res) => {
   });
 });
 
-app.options("/collect", legacyPublicCors);
-app.post("/collect", legacyPublicCors, async (req, res) => {
+app.options("/collect", publicCors);
+app.post("/collect", publicCors, async (req, res) => {
   const siteKey = req.headers["x-site-key"];
   const site = siteKey ? await getSiteByKey(db, siteKey) : null;
 
@@ -5767,13 +5764,13 @@ app.post("/collect", legacyPublicCors, async (req, res) => {
       return res.status(400).json({ error: "event_source_url is required for website events" });
     }
 
-    console.log("[COLLECT SOURCES]", {
+    debugLog("[COLLECT SOURCES]", {
       event_source_url_source: sourceUrlResolution.source
     });
   }
 
   const { userData, sources: userDataSources } = enrichUserDataWithSources(inboundEvent, req);
-  console.log("[COLLECT SOURCES]", {
+  debugLog("[COLLECT SOURCES]", {
     client_user_agent_source: userDataSources.client_user_agent,
     client_ip_address_source: userDataSources.client_ip_address
   });
