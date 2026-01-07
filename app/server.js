@@ -331,7 +331,7 @@ const legacyPublicCors = cors({
 });
 
 const PUBLIC_CORS_METHODS = "GET,POST,OPTIONS";
-const PUBLIC_CORS_HEADERS = "Content-Type";
+const PUBLIC_CORS_HEADERS = "content-type, x-site-key";
 const PUBLIC_CORS_MAX_AGE = "86400";
 
 function setPublicCorsHeaders(res, origin) {
@@ -355,43 +355,47 @@ function logCorsDeny(siteKey, origin, allowed) {
 }
 
 function getCorsSiteKey(req) {
-  if (req.method === "GET") {
-    return req.query?.site_key ?? null;
+  return (
+    req.get("x-site-key") ??
+    req.query?.site_key ??
+    req.body?.site_key ??
+    null
+  );
+}
+
+async function getSiteByOrigin(origin) {
+  if (!origin) return null;
+  const sites = await getSites(db);
+  for (const site of sites) {
+    const { origins } = parseAllowedOriginsInput(site.allowed_origins);
+    if (origins.includes(origin)) {
+      return site;
+    }
   }
-  if (req.method === "POST") {
-    return req.body?.site_key ?? null;
-  }
-  return req.query?.site_key ?? req.body?.site_key ?? null;
+  return null;
 }
 
 async function publicCors(req, res, next) {
   try {
     const origin = req.get("origin");
     if (!origin) {
-      setPublicCorsVary(res);
-      logCorsDeny(null, null, null);
-      return res.status(403).json({ ok: false, error: "origin_required" });
+      return next();
     }
     const siteKey = getCorsSiteKey(req);
-    if (!siteKey) {
-      setPublicCorsVary(res);
-      logCorsDeny(null, origin, null);
-      return res.status(403).json({ ok: false, error: "site_key_required" });
-    }
-    const site = await getSiteByKey(db, siteKey);
+    const site = siteKey ? await getSiteByKey(db, siteKey) : await getSiteByOrigin(origin);
     if (!site) {
       setPublicCorsVary(res);
-      logCorsDeny(siteKey, origin, null);
-      return res.status(403).json({ ok: false, error: "site_key_invalid" });
+      logCorsDeny(siteKey ?? null, origin, null);
+      return res.status(403).json({ ok: false, error: "site_key_or_origin_required" });
     }
     const { origins } = parseAllowedOriginsInput(site.allowed_origins);
     if (!origins.includes(origin)) {
       setPublicCorsVary(res);
-      logCorsDeny(siteKey, origin, origins.join(","));
+      logCorsDeny(site.site_key ?? siteKey, origin, origins.join(","));
       return res.status(403).json({ ok: false, error: "origin_not_allowed", origin });
     }
     setPublicCorsHeaders(res, origin);
-    logCorsAllow(siteKey, origin);
+    logCorsAllow(site.site_key ?? siteKey, origin);
     if (req.method === "OPTIONS") {
       return res.status(204).send();
     }
@@ -1428,7 +1432,7 @@ async function sendTestEvent({ site, eventType, overrides }) {
 
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-app.options("/sdk/config", publicCors);
+app.options("/sdk/*", publicCors);
 app.get("/sdk/config", publicCors, async (req, res) => {
   const siteKey = req.query.site_key;
   const videoId = req.query.video_id;
@@ -1454,7 +1458,6 @@ app.get("/sdk/config", publicCors, async (req, res) => {
   });
 });
 
-app.options("/sdk/ping", publicCors);
 app.get("/sdk/ping", publicCors, async (req, res) => {
   const siteKey = req.query.site_key ?? null;
   const videoId = req.query.video_id ?? null;
