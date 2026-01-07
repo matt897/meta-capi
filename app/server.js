@@ -330,74 +330,22 @@ const legacyPublicCors = cors({
   optionsSuccessStatus: 204
 });
 
-const PUBLIC_CORS_METHODS = "GET,POST,OPTIONS";
-const PUBLIC_CORS_HEADERS = "content-type, x-site-key";
+const PUBLIC_CORS_METHODS = "GET, POST, OPTIONS";
+const PUBLIC_CORS_HEADERS = "Content-Type, X-Site-Key";
 const PUBLIC_CORS_MAX_AGE = "86400";
 
-function setPublicCorsHeaders(res, origin) {
-  res.set("Access-Control-Allow-Origin", origin);
-  res.set("Vary", "Origin");
+function setPublicCorsHeaders(res) {
+  res.set("Access-Control-Allow-Origin", "*");
   res.set("Access-Control-Allow-Methods", PUBLIC_CORS_METHODS);
   res.set("Access-Control-Allow-Headers", PUBLIC_CORS_HEADERS);
   res.set("Access-Control-Max-Age", PUBLIC_CORS_MAX_AGE);
 }
 
-function setPublicCorsVary(res) {
-  res.set("Vary", "Origin");
-}
-
-function logCorsAllow(siteKey, origin) {
-  console.debug(`[CORS ALLOW] site_key=${siteKey} origin=${origin}`);
-}
-
-function logCorsDeny(siteKey, origin, allowed) {
-  console.log(`[CORS DENY] site_key=${siteKey ?? "unknown"} origin=${origin ?? "unknown"} allowed=${allowed ?? ""}`);
-}
-
-function getCorsSiteKey(req) {
-  return (
-    req.get("x-site-key") ??
-    req.query?.site_key ??
-    req.body?.site_key ??
-    null
-  );
-}
-
-async function getSiteByOrigin(origin) {
-  if (!origin) return null;
-  const sites = await getSites(db);
-  for (const site of sites) {
-    const { origins } = parseAllowedOriginsInput(site.allowed_origins);
-    if (origins.includes(origin)) {
-      return site;
-    }
-  }
-  return null;
-}
-
 async function publicCors(req, res, next) {
   try {
-    const origin = req.get("origin");
-    if (!origin) {
-      return next();
-    }
-    const siteKey = getCorsSiteKey(req);
-    const site = siteKey ? await getSiteByKey(db, siteKey) : await getSiteByOrigin(origin);
-    if (!site) {
-      setPublicCorsVary(res);
-      logCorsDeny(siteKey ?? null, origin, null);
-      return res.status(403).json({ ok: false, error: "site_key_or_origin_required" });
-    }
-    const { origins } = parseAllowedOriginsInput(site.allowed_origins);
-    if (!origins.includes(origin)) {
-      setPublicCorsVary(res);
-      logCorsDeny(site.site_key ?? siteKey, origin, origins.join(","));
-      return res.status(403).json({ ok: false, error: "origin_not_allowed", origin });
-    }
-    setPublicCorsHeaders(res, origin);
-    logCorsAllow(site.site_key ?? siteKey, origin);
+    setPublicCorsHeaders(res);
     if (req.method === "OPTIONS") {
-      return res.status(204).send();
+      return res.status(200).send();
     }
     return next();
   } catch (error) {
@@ -1624,6 +1572,41 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
         }
       }
 
+      const durationReadyLogged = new WeakSet();
+
+      function hasValidDuration(video) {
+        return Number.isFinite(video.duration) && video.duration > 0;
+      }
+
+      function logDurationReady(video) {
+        if (durationReadyLogged.has(video)) return;
+        durationReadyLogged.add(video);
+        console.log("[CAPI VT] duration_ready", { duration: video.duration, readyState: video.readyState });
+      }
+
+      function waitForDuration(video, cb) {
+        if (hasValidDuration(video)) {
+          logDurationReady(video);
+          cb();
+          return;
+        }
+        let settled = false;
+        const events = ["loadedmetadata", "durationchange", "canplay", "canplaythrough"];
+        const maybeResolve = () => {
+          if (settled) return;
+          if (!hasValidDuration(video)) return;
+          settled = true;
+          events.forEach(eventName => {
+            video.removeEventListener(eventName, maybeResolve);
+          });
+          logDurationReady(video);
+          cb();
+        };
+        events.forEach(eventName => {
+          video.addEventListener(eventName, maybeResolve);
+        });
+      }
+
       function findVideoElement(selector, log, warn, error, warnOnce) {
         return new Promise(resolve => {
           const start = Date.now();
@@ -1899,6 +1882,9 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
 
           function sampleTick(source) {
             if (!video) return;
+            if (!Number.isFinite(video.duration) || video.duration <= 0) {
+              return;
+            }
             const currentDuration = duration();
             const currentTime = video.currentTime || 0;
             if (!currentDuration) {
@@ -1933,6 +1919,14 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
             }, tickIntervalMs);
           }
 
+          function startLoopWhenReady() {
+            waitForDuration(video, () => {
+              if (!video.paused && !video.ended) {
+                startLoop();
+              }
+            });
+          }
+
           function stopLoop() {
             if (!timerId) return;
             clearInterval(timerId);
@@ -1946,7 +1940,7 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
           video.addEventListener('loadedmetadata', () => {
             log('loadedmetadata', { duration: video.duration });
             if (!video.paused && !video.ended) {
-              startLoop();
+              startLoopWhenReady();
             }
           });
 
@@ -1957,11 +1951,11 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
           }, 5000);
 
           video.addEventListener('playing', () => {
-            startLoop();
+            startLoopWhenReady();
           });
 
           video.addEventListener('play', () => {
-            startLoop();
+            startLoopWhenReady();
           });
 
           video.addEventListener('pause', () => {
@@ -1978,7 +1972,7 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
           });
 
           if (!video.paused && !video.ended) {
-            startLoop();
+            startLoopWhenReady();
           }
         } catch (err) {
           error('tracker setup failed', err);
