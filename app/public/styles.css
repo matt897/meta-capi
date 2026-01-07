@@ -7,6 +7,11 @@
   --accent: #38bdf8;
   --danger: #f97316;
   --border: #1f2937;
+  --radius: 12px;
+  --space-8: 8px;
+  --space-12: 12px;
+  --space-16: 16px;
+  --space-24: 24px;
 }
 
 * {
@@ -22,9 +27,9 @@ body {
 }
 
 .container {
-  max-width: 1200px;
+  max-width: 1320px;
   margin: 0 auto;
-  padding: 32px 24px 64px;
+  padding: 24px 24px 64px;
 }
 
 .nav {
@@ -52,9 +57,10 @@ body {
 
 .card {
   background: var(--card);
-  border-radius: 16px;
+  border-radius: var(--radius);
   padding: 20px 24px;
   margin-bottom: 20px;
+  border: 1px solid var(--border);
   box-shadow: 0 10px 20px rgba(0, 0, 0, 0.2);
 }
 
@@ -71,6 +77,24 @@ body {
   margin-bottom: 24px;
 }
 
+.control-grid {
+  display: grid;
+  gap: var(--space-16);
+}
+
+.control-row {
+  display: grid;
+  gap: var(--space-16);
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  align-items: end;
+}
+
+.control-actions {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--space-12);
+}
+
 label {
   display: flex;
   flex-direction: column;
@@ -83,10 +107,11 @@ select,
 textarea {
   width: 100%;
   padding: 10px 12px;
-  border-radius: 10px;
+  border-radius: var(--radius);
   border: 1px solid var(--border);
   background: #0f172a;
   color: inherit;
+  min-height: 40px;
 }
 
 button,
@@ -94,11 +119,12 @@ button,
   background: var(--accent);
   border: none;
   padding: 10px 16px;
-  border-radius: 10px;
+  border-radius: var(--radius);
   font-weight: 700;
   cursor: pointer;
   color: #0f172a;
   text-decoration: none;
+  min-height: 40px;
 }
 
 .button.secondary {
@@ -268,6 +294,21 @@ td {
   vertical-align: bottom;
 }
 
+table thead th {
+  position: sticky;
+  top: 0;
+  background: var(--card);
+  z-index: 1;
+}
+
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+}
+
+.wrap-anywhere {
+  overflow-wrap: anywhere;
+}
+
 .pill-error {
   background: rgba(248, 113, 113, 0.2);
   color: #f87171;
@@ -295,6 +336,10 @@ td {
   gap: 8px;
   max-height: 600px;
   overflow: auto;
+}
+
+.event-stream.loading {
+  opacity: 0.6;
 }
 
 .event-row {
@@ -463,5 +508,11 @@ pre code {
 @media (max-width: 900px) {
   .split-pane {
     grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 720px) {
+  .container {
+    padding: 16px 16px 48px;
   }
 }

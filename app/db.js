@@ -643,7 +643,18 @@ function safeJsonParse(value) {
 
 export async function listEvents(
   db,
-  { limit = 50, siteId, datasetId, status, eventName, videoId, eventType, receivedAtRange }
+  {
+    limit = 50,
+    siteId,
+    datasetId,
+    pixelId,
+    status,
+    eventName,
+    videoId,
+    eventType,
+    receivedAtRange,
+    videoMode
+  }
 ) {
   const conditions = [];
   const params = [];
@@ -651,6 +662,10 @@ export async function listEvents(
   if (siteId) {
     conditions.push("events.site_id = ?");
     params.push(siteId);
+  }
+  if (pixelId) {
+    conditions.push("sites.pixel_id = ?");
+    params.push(pixelId);
   }
   if (datasetId) {
     conditions.push("sites.dataset_fk = ?");
@@ -678,6 +693,10 @@ export async function listEvents(
   if (eventType) {
     conditions.push("events.type = ?");
     params.push(eventType);
+  }
+  if (videoMode) {
+    conditions.push("events.video_mode = ?");
+    params.push(videoMode);
   }
   if (receivedAtRange?.startUtcMs !== undefined && receivedAtRange?.endUtcMs !== undefined) {
     conditions.push("events.received_at_utc_ms BETWEEN ? AND ?");
@@ -889,12 +908,20 @@ export async function listErrorGroups(db, datasetId) {
   );
 }
 
-export async function listErrors(db, { type, limit = 20, datasetId }) {
+export async function listErrors(db, { type, limit = 20, datasetId, siteId, pixelId }) {
   const conditions = ["errors.type = ?"];
   const params = [type];
   if (datasetId) {
     conditions.push("sites.dataset_fk = ?");
     params.push(datasetId);
+  }
+  if (siteId) {
+    conditions.push("errors.site_id = ?");
+    params.push(siteId);
+  }
+  if (pixelId) {
+    conditions.push("sites.pixel_id = ?");
+    params.push(pixelId);
   }
   const whereClause = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
   const rows = await db.all(
@@ -921,12 +948,20 @@ export async function listErrors(db, { type, limit = 20, datasetId }) {
   }));
 }
 
-export async function listRecentErrors(db, limit = 20, datasetId) {
+export async function listRecentErrors(db, limit = 20, { datasetId, siteId, pixelId } = {}) {
   const conditions = [];
   const params = [];
   if (datasetId) {
     conditions.push("sites.dataset_fk = ?");
     params.push(datasetId);
+  }
+  if (siteId) {
+    conditions.push("errors.site_id = ?");
+    params.push(siteId);
+  }
+  if (pixelId) {
+    conditions.push("sites.pixel_id = ?");
+    params.push(pixelId);
   }
   const whereClause = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
   const rows = await db.all(
