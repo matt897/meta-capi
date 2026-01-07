@@ -1704,7 +1704,14 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
           pageUrl: window.location.href
         });
 
-        const baseUrl = new URL(script.src, window.location.href).origin;
+        const apiBaseCandidate = script.dataset.apiBase || window.CAPI_VT_API_BASE;
+        const baseUrl = apiBaseCandidate
+          ? String(apiBaseCandidate).replace(/\/+$/, '')
+          : new URL(script.src, window.location.href).origin;
+        const trackUrl = baseUrl + '/v/track';
+        if (debug) {
+          console.log('[CAPI VT] api_base', { apiBase: baseUrl, trackUrl });
+        }
         try {
           const defaultConfig = {
             enabled: true,
@@ -1875,7 +1882,6 @@ app.get("/sdk/video-tracker.js", async (req, res) => {
             if (fbclid) payload.fbclid = fbclid;
 
             try {
-              const trackUrl = baseUrl + '/v/track';
               console.log('[CAPI VT] POST /v/track milestone=' + percent + ' pct=' + percentWatched() + ' ws=' + Math.round(watchedSeconds));
               log('send attempt', { milestone: percent, event_id: eventId, url: trackUrl });
               const response = await fetch(trackUrl, {
