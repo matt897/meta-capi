@@ -112,6 +112,8 @@ const DB_PATH = process.env.DB_PATH || "./data/meta-capi.sqlite";
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL?.replace(/\/+$/, "") || null;
 const APP_ENCRYPTION_KEY = process.env.APP_ENCRYPTION_KEY || "";
 const DEFAULT_TIME_ZONE = process.env.DEFAULT_TIME_ZONE || "UTC";
+const CAPI_MODE = (process.env.CAPI_MODE || "live").toLowerCase();
+const TEST_MODE_ENABLED = CAPI_MODE === "test";
 const CORS_ALLOWED_ORIGINS = (process.env.CORS_ALLOWED_ORIGINS || "https://mattmakesmoney.com")
   .split(",")
   .map(origin => origin.trim())
@@ -934,22 +936,51 @@ function resolveEventSourceUrl(event, req) {
   return null;
 }
 
+function resolveEventSourceUrlWithSource(event, req) {
+  if (event.event_source_url) {
+    return { value: event.event_source_url, source: "payload.event_source_url" };
+  }
+  const referer = req.get("referer");
+  if (referer) {
+    return { value: referer, source: "header.referer" };
+  }
+  const origin = req.get("origin");
+  if (origin) {
+    return { value: origin, source: "header.origin" };
+  }
+  return { value: null, source: "missing" };
+}
+
 function deriveFbcFromFbclid(fbclid) {
   if (!fbclid) return null;
   return `fb.1.${Math.floor(Date.now() / 1000)}.${fbclid}`;
 }
 
-function enrichUserData(event, req) {
+function enrichUserDataWithSources(event, req) {
   const existing = event.user_data && typeof event.user_data === "object" ? event.user_data : {};
   const userData = { ...existing };
+  const sources = {
+    client_user_agent: "missing",
+    client_ip_address: "missing"
+  };
   const userAgent = req.get("user-agent");
-  const clientIp = getClientIp(req);
+  const forwardedIp = getForwardedFor(req);
+  const clientIp = req.ip || null;
 
-  if (!userData.client_user_agent && userAgent) {
+  if (userData.client_user_agent) {
+    sources.client_user_agent = "payload.user_data";
+  } else if (userAgent) {
     userData.client_user_agent = userAgent;
+    sources.client_user_agent = "header.user-agent";
   }
-  if (!userData.client_ip_address && clientIp) {
+  if (userData.client_ip_address) {
+    sources.client_ip_address = "payload.user_data";
+  } else if (forwardedIp) {
+    userData.client_ip_address = forwardedIp;
+    sources.client_ip_address = "header.x-forwarded-for";
+  } else if (clientIp) {
     userData.client_ip_address = clientIp;
+    sources.client_ip_address = "req.ip";
   }
 
   const cookies = parseCookies(req.headers.cookie || "");
@@ -964,7 +995,7 @@ function enrichUserData(event, req) {
   }
 
   event.user_data = userData;
-  return userData;
+  return { userData, sources };
 }
 
 function hasMinimumUserData(userData) {
@@ -5335,26 +5366,34 @@ app.post("/v/track", publicCors, async (req, res) => {
   const mode = video ? normalizeVideoMode(video.mode) : "off";
   const inboundTestEventCode = getTestEventCode(req, req.body);
   const isInboundTestEvent = isTestEvent(req, req.body);
-  const testEventCode = inboundTestEventCode || (mode === "test" ? site.test_event_code : null);
+  const testEventCode =
+    inboundTestEventCode || (TEST_MODE_ENABLED && mode === "test" ? site.test_event_code : null);
   const isTest = isInboundTestEvent || Boolean(testEventCode);
   const percentValue = Number.parseInt(percent, 10);
   const eventName = Number.isFinite(percentValue) ? `Video${percentValue}` : "Video";
-  const resolvedSourceUrl = event_source_url || video?.page_url || resolveEventSourceUrl({}, req) || "";
+  const sourceUrlResolution = resolveEventSourceUrlWithSource({ event_source_url }, req);
+  const resolvedSourceUrl = sourceUrlResolution.value || "";
   if (!resolvedSourceUrl) {
     return res.status(400).json({ ok: false, error: "missing event_source_url" });
   }
 
   const eventId = event_id || uuid();
-  const userData = {
-    client_ip_address: getClientIp(req),
-    client_user_agent: req.get("user-agent")
-  };
+  const { userData, sources: userDataSources } = enrichUserDataWithSources(
+    { user_data: req.body?.user_data },
+    req
+  );
   if (fbp) userData.fbp = fbp;
   if (fbc) {
     userData.fbc = fbc;
   } else if (fbclid) {
     userData.fbc = deriveFbcFromFbclid(fbclid);
   }
+
+  console.log("[TRACK SOURCES]", {
+    event_source_url_source: sourceUrlResolution.source,
+    client_user_agent_source: userDataSources.client_user_agent,
+    client_ip_address_source: userDataSources.client_ip_address
+  });
 
   const inboundEvent = {
     event_name: eventName,
@@ -5698,7 +5737,7 @@ app.post("/collect", legacyPublicCors, async (req, res) => {
   const inboundEvent = { ...req.body };
   const inboundTestEventCode = getTestEventCode(req, inboundEvent);
   const isInboundTestEvent = isTestEvent(req, inboundEvent);
-  const testEventCode = inboundTestEventCode || site.test_event_code || null;
+  const testEventCode = inboundTestEventCode || (TEST_MODE_ENABLED ? site.test_event_code : null);
   const isTest = isInboundTestEvent || Boolean(testEventCode);
   if ("test_event_code" in inboundEvent) {
     delete inboundEvent.test_event_code;
@@ -5714,14 +5753,23 @@ app.post("/collect", legacyPublicCors, async (req, res) => {
   }
 
   if (inboundEvent.action_source === "website") {
-    inboundEvent.event_source_url = resolveEventSourceUrl(inboundEvent, req);
+    const sourceUrlResolution = resolveEventSourceUrlWithSource(inboundEvent, req);
+    inboundEvent.event_source_url = sourceUrlResolution.value;
     if (!inboundEvent.event_source_url) {
       await insertError(db, { type: "validation", site_id: site.site_id, message: "missing event_source_url" });
       return res.status(400).json({ error: "event_source_url is required for website events" });
     }
+
+    console.log("[COLLECT SOURCES]", {
+      event_source_url_source: sourceUrlResolution.source
+    });
   }
 
-  const userData = enrichUserData(inboundEvent, req);
+  const { userData, sources: userDataSources } = enrichUserDataWithSources(inboundEvent, req);
+  console.log("[COLLECT SOURCES]", {
+    client_user_agent_source: userDataSources.client_user_agent,
+    client_ip_address_source: userDataSources.client_ip_address
+  });
   const minimumUserDataPresent = hasMinimumUserData(userData);
 
   let eventId = inboundEvent.event_id;
